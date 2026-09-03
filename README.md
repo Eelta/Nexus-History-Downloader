@@ -1,5 +1,7 @@
 # Nexus History Downloader
 
+**English** | [简体中文](README-CN.md)
+
 ## Features
 
 - **Standalone desktop UI**: No browser needed — the app loads a local dashboard in its own window;

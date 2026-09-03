@@ -1,6 +1,8 @@
 Multi-Threaded Custom File Downloader — License and Attribution Notice
 ======================================================================
 
+Language: English (this file) | 简体中文版: LICENSE-NOTICE-CN.txt
+
 This program is an independent third-party utility that only keeps the
 "download custom files" feature.
 

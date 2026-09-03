@@ -1,5 +1,7 @@
 # Nexus History Downloader
 
+[English](README.md) | **简体中文**
+
 ## 功能
 
 - **独立桌面界面**：无需浏览器，应用自带窗口加载本地仪表盘；
