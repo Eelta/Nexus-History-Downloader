@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nexus Mods · 天际下载仪表盘</title>
+  <link rel="stylesheet" href="static/style.css?v=26" />
+</head>
+<body>
+  <header class="topbar glass">
+    <div class="topbar-left">
+      <h1>天际模组更新监测</h1>
+      <span id="demoBadge" class="chip chip-warn hidden">演示数据</span>
+    </div>
+    <div class="topbar-right">
+      <div class="status-chips">
+        <span id="authChip" class="chip">会话: 检测中…</span>
+        <span id="countChip" class="chip">模组: 0</span>
+        <span id="filterChip" class="chip">筛选: -</span>
+        <span id="refreshChip" class="chip">数据: -</span>
+      </div>
+      <button id="btnRefresh" class="btn btn-primary">刷新数据</button>
+      <button id="btnProfile" class="btn">浏览器登录</button>
+      <button id="btnDiscardToggle" class="btn">历史丢弃 (0)</button>
+    </div>
+  </header>
+
+  <div class="dirbar">
+    <span class="dirbar-label">默认下载目录</span>
+    <input id="dlDirInput" class="dirbar-input" type="text" spellcheck="false" placeholder="例如 D:\Downloads">
+    <button id="btnBrowseDir" class="btn" type="button">浏览…</button>
+    <button id="btnDlDir" class="btn" type="button">设为默认</button>
+    <span class="dirbar-label">并发线程</span>
+    <input id="threadRange" class="thread-range" type="range" min="8" max="256" step="8" value="64" title="最大并发连接数（实时生效于新任务）">
+    <span id="threadValue" class="dirbar-label thread-value">64</span>
+  </div>
+
+  <div id="dlProgress" class="dlprogress hidden">
+    <div id="dlList" class="dl-list"></div>
+  </div>
+
+  <section id="progressBar" class="progress glass hidden">
+    <div class="progress-inner"></div>
+    <span id="progressText"></span>
+  </section>
+
+  <section id="notice" class="notice glass hidden">
+    <span id="noticeText"></span>
+    <button id="noticeClose" class="notice-x hidden" type="button" title="关闭">×</button>
+  </section>
+
+  <main id="modList" class="mod-list"></main>
+
+  <section id="empty" class="empty hidden">
+    <p>暂无数据。点右上角 <b>浏览器登录</b> 或 <b>刷新数据</b> 开始。</p>
+  </section>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="static/app.js?v=27"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# single cache folder (engine temps + dashboard data)
+cache/
+
+# local verification scratch
+.verify/
+
+# dotnet build outputs
+bin/
+obj/
+*.user
+.vs/
+result.txt
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+
+# one-click exe build artifacts
+build/
+dist/
+
+# local machine settings (download dir etc.) - never upload
+settings.json
