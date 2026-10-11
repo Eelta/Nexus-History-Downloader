@@ -9,6 +9,15 @@
     <AssemblyName>NHD</AssemblyName>
     <RootNamespace>NexusSetup</RootNamespace>
     <ApplicationIcon>..\..\assets\icon.ico</ApplicationIcon>
+    <UninstallerPayload Condition="'$(UninstallerPayload)' == ''">$(MSBuildProjectDirectory)\..\..\build\_uninstaller_publish\Uninstall.exe</UninstallerPayload>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(UninstallerPayload)" LogicalName="NHD.Uninstaller.exe" />
+  </ItemGroup>
+
+  <Target Name="RequireUninstallerPayload" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(UninstallerPayload)')" Text="Missing lightweight uninstaller: $(UninstallerPayload). Run build-exe.cmd or set UninstallerPayload to a compiled src/Uninstaller/Program.cs executable." />
+  </Target>
 
 </Project>

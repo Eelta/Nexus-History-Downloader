@@ -6,11 +6,16 @@ exits non-zero on any failure.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import pathlib
 import py_compile
 import sys
-from datetime import datetime
+import tempfile
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bs4 import BeautifulSoup
 
@@ -52,6 +57,15 @@ def test_nexus_date() -> None:
     assert d3 is not None and d3.year == 2026 and d3.month == 8 and d3.day == 27, d3
     d4 = parse_nexus_date("05-Aug-2026")
     assert d4 is not None and d4.year == 2026 and d4.month == 8, d4
+    for text in ("2026-04-01 16:55", "2026/4/1, 16:55",
+                 "01 April 2026, 16:55", "01 April 2026, 4:55 pm"):
+        assert parse_nexus_date(text) == datetime(2026, 4, 1, 16, 55), text
+    for text in ("2026-04-01T16:55:00+08:00", "01 April 2026, 16:55 +0800"):
+        d = parse_nexus_date(text)
+        assert d is not None and d.astimezone(timezone.utc) == datetime(
+            2026, 4, 1, 8, 55, tzinfo=timezone.utc), (text, d)
+    assert parse_nexus_date("01 April 2026, 16:55 UTC") == datetime(
+        2026, 4, 1, 16, 55, tzinfo=timezone.utc)
     assert parse_nexus_date("not a date") is None
 
 
@@ -70,6 +84,10 @@ def test_mod_meta() -> None:
     assert meta["author"] == "Sus620", meta
     assert meta["updated_at"] and meta["updated_at"].startswith("2025"), meta
     assert meta["category"] == "User Interface", meta
+    # The metadata fallback must not reduce an accurate timestamp to midnight.
+    with patch("scraper.TZ_OFFSET_MIN", -480):
+        meta = parse_mod_meta(soup, soup.get_text("\n"))
+    assert meta["updated_at"] == "2025-05-03T12:07:00+00:00", meta
 
 
 def test_files_html() -> None:
@@ -134,6 +152,11 @@ def test_filter_downloads() -> None:
     assert removed == 1, (kept, removed)
     assert len(kept) == 3, kept
     assert "2025-03-10" in kept[0]["updated_at"]
+    # Compare instants, not ISO strings: local 14:02 is earlier than UTC 08:55.
+    before = mk("2026-04-01T14:02:00+08:00", "2026-04-01T08:55:00Z")
+    after = mk("2026-04-01T08:55:00Z", "2026-04-01T14:02:00+08:00")
+    kept, removed = filter_old_downloads([before, after])
+    assert kept == [before] and removed == 1, (kept, removed)
 
 
 def test_demo_data() -> None:
@@ -184,6 +207,125 @@ def test_light_filter() -> None:
     ])
     assert removed == 1, (kept, removed)
     assert len(kept) == 3, kept
+
+
+def _history_item(dl: str, up: str, mod_id: int = 42) -> dict:
+    return {"domain": config.TARGET_GAME, "mod_id": mod_id,
+            "cells": ["Example mod", dl, "author", "category", up]}
+
+
+def test_same_day_download_regression() -> None:
+    from scraper import NexusScraper, _history_date_tokens, light_filter_items
+
+    downloaded = _history_item("2026-04-01 16:55", "2026-04-01 14:02")
+    downloaded["_earliest_dl"] = "2026-03-01T00:00:00+00:00"
+    pending = _history_item("2026-04-01 13:55", "2026-04-01 14:02", 43)
+    named = _history_item("01 April 2026, 16:55", "01 April 2026, 14:02", 44)
+    unknown = _history_item("", "2026-04-01 14:02", 45)
+    # A generic row may contain the update date; it is not a missing Last DL.
+    unknown["rowText"] = "Example mod 2026-04-01 14:02"
+    assert _history_date_tokens(unknown) == ("", "2026-04-01 14:02")
+    with patch("scraper.TZ_OFFSET_MIN", -480):
+        kept, removed = light_filter_items([downloaded, pending, named, unknown])
+        displayed = NexusScraper(None)._slim_entry(downloaded)
+        unknown_display = NexusScraper(None)._slim_entry(unknown)
+    assert kept == [pending, unknown] and removed == 2, (kept, removed)
+    assert displayed["updated_at"] == "2026-04-01T06:02:00+00:00", displayed
+    assert displayed["downloaded_at"] == "2026-04-01T08:55:00+00:00", displayed
+    assert unknown_display["downloaded_at"] is None, unknown_display
+
+
+def test_history_merge_latest_download() -> None:
+    from scraper import NexusScraper, _merge_history_item, light_filter_items
+
+    older = _history_item("2026-03-01 12:00", "2026-04-01 14:02")
+    latest = _history_item("2026-04-01 16:55", "2026-04-01 14:02")
+    middle = _history_item("2026-04-01 13:55", "2026-04-01 14:02")
+    unknown = _history_item("", "2026-04-01 14:02")
+    # Merge is shared by same-page and later-page rows; neither encounter
+    # order nor a missing date may replace the most recent known download.
+    for rows in ([older, middle, latest, unknown],
+                 [latest, unknown, middle, older]):
+        seen = {}
+        added = [_merge_history_item(seen, row) for row in rows]
+        assert added == [True, False, False, False], added
+        assert list(seen.values()) == [latest], seen
+        assert light_filter_items(list(seen.values())) == ([], 1)
+        displayed = NexusScraper(None)._slim_entry(next(iter(seen.values())))
+        assert parse_nexus_date(displayed["downloaded_at"]).hour == 16, displayed
+    # Prefer the richer DOM row when it describes the same instant as XHR.
+    xhr = {"domain": config.TARGET_GAME, "mod_id": 42,
+           "rowText": "2026-04-01 16:55"}
+    seen = {}
+    _merge_history_item(seen, xhr)
+    _merge_history_item(seen, latest)
+    assert list(seen.values()) == [latest], seen
+
+
+def test_scan_cache_timezone() -> None:
+    import scraper
+
+    item = _history_item("2026-04-01 16:55", "2026-04-01 14:02")
+    sc = scraper.NexusScraper(None)
+    with patch.object(scraper, "TZ_OFFSET_MIN", -480):
+        sc._save_scan_cache([item])
+        saved = json.loads(config.SCAN_CACHE_FILE.read_text(encoding="utf-8"))
+        assert saved["timezone_offset_min"] == -480, saved
+        expected = sc._slim_entry(item)
+        scraper.TZ_OFFSET_MIN = 0  # Simulate a fresh backend process.
+        restored = sc._load_scan_cache()
+        assert restored == [item], restored
+        assert scraper.TZ_OFFSET_MIN == -480, scraper.TZ_OFFSET_MIN
+        assert sc._slim_entry(restored[0]) == expected
+        assert scraper.light_filter_items(restored) == ([], 1)
+        saved.pop("timezone_offset_min")
+        config.SCAN_CACHE_FILE.write_text(json.dumps(saved), encoding="utf-8")
+        assert sc._load_scan_cache() is None, "cache without timezone must be rescanned"
+
+
+def test_refresh_empty_success() -> None:
+    import app as app_module
+
+    state = app_module.AppState()
+    state.mods = [{"mod_id": 42}]
+    state.refresh_version = 7
+    state.refresh_error = "previous error"
+    sc = SimpleNamespace(run=AsyncMock(return_value=[]), filter_removed=1)
+    playwright = MagicMock()
+    with patch.object(app_module, "state", state), \
+            patch.object(app_module, "runner", return_value=sc), \
+            patch.object(app_module, "async_playwright", return_value=playwright):
+        asyncio.run(app_module.refresh_job(force=True))
+    assert state.mods == [], state.mods
+    assert state.refresh_version == 8, state.refresh_version
+    assert state.last_refresh and state.refresh_error is None
+    assert state.filter_stats == {
+        "game": config.TARGET_GAME, "kept": 0, "removed_old_downloads": 1,
+    }, state.filter_stats
+    assert state.progress.snapshot()["running"] is False
+    sc.run.assert_awaited_once_with(playwright.__aenter__.return_value, force_refresh=True)
+
+
+def test_refresh_failure_preserves_results() -> None:
+    import app as app_module
+
+    state = app_module.AppState()
+    previous = [{"mod_id": 42}]
+    state.mods = previous
+    state.refresh_version = 7
+    state.last_refresh = "previous scan"
+    state.filter_stats = {"kept": 1}
+    sc = SimpleNamespace(run=AsyncMock(side_effect=RuntimeError("test scan failure")))
+    with patch.object(app_module, "state", state), \
+            patch.object(app_module, "runner", return_value=sc), \
+            patch.object(app_module, "async_playwright", return_value=MagicMock()), \
+            patch.object(app_module.log, "exception"):
+        asyncio.run(app_module.refresh_job(force=True))
+    assert state.mods is previous, state.mods
+    assert state.refresh_version == 7 and state.last_refresh == "previous scan"
+    assert state.filter_stats == {"kept": 1}, state.filter_stats
+    assert state.refresh_error == "test scan failure", state.refresh_error
+    assert state.progress.snapshot()["running"] is False
 
 
 def test_files_structured() -> None:
@@ -259,19 +401,50 @@ def test_api_smoke() -> None:
 
 def main() -> None:
     print("nexus-dashboard self-check")
-    check("py files compile", test_compile)
-    check("nexus date parser", test_nexus_date)
-    check("mod meta parser", test_mod_meta)
-    check("files section parser", test_files_html)
-    check("files structured parser (Nexus 2.0)", test_files_structured)
-    check("changelog parser", test_changelog_text)
-    check("changelog structured parser", test_changelog_html)
-    check("download-window filter (update>=download)", test_filter_downloads)
-    check("light filter skips crawling", test_light_filter)
-    check("progress stage flips running", test_progress_stage_marks_running)
-    check("demo data build + schema", test_demo_data)
-    check("discard-tag API (post-processing)", test_discard_api)
-    check("FastAPI smoke (/ /api/status /api/mods /api/export)", test_api_smoke)
+    FAILURES.clear()
+    # Importing app initializes its session manager and log file, so redirect
+    # every runtime-data path before the first app import. User data is never
+    # read, overwritten, or deleted by the self-check suite.
+    with tempfile.TemporaryDirectory(prefix="nexus-self-check-") as temp_dir:
+        root = pathlib.Path(temp_dir)
+        cache = root / "cache" / "nexus-dashboard"
+        paths = {
+            "REPO_ROOT": root, "CACHE_DIR": cache,
+            "SESSION_FILE": cache / "session.json",
+            "SESSION_META_FILE": cache / "session.meta.json",
+            "DEMO_DATA_FILE": cache / "demo_mods.json",
+            "MODS_CACHE_DIR": cache / "mods",
+            "SCAN_CACHE_FILE": cache / "history-scan.json",
+            "DISCARD_FILE": cache / "discarded.json",
+            "PIP_CACHE_DIR": cache / "pip",
+        }
+        old_handlers = set(logging.getLogger().handlers)
+        with patch.multiple(config, **paths), patch("scraper.TZ_OFFSET_MIN", 0):
+            config.ensure_dirs()
+            try:
+                check("py files compile", test_compile)
+                check("nexus date parser", test_nexus_date)
+                check("mod meta parser", test_mod_meta)
+                check("files section parser", test_files_html)
+                check("files structured parser (Nexus 2.0)", test_files_structured)
+                check("changelog parser", test_changelog_text)
+                check("changelog structured parser", test_changelog_html)
+                check("download-window filter (update>=download)", test_filter_downloads)
+                check("light filter skips crawling", test_light_filter)
+                check("same-day latest download regression", test_same_day_download_regression)
+                check("history merge keeps latest download", test_history_merge_latest_download)
+                check("scan cache preserves timezone", test_scan_cache_timezone)
+                check("empty successful refresh replaces old results", test_refresh_empty_success)
+                check("failed refresh preserves old results", test_refresh_failure_preserves_results)
+                check("progress stage flips running", test_progress_stage_marks_running)
+                check("demo data build + schema", test_demo_data)
+                check("discard-tag API (post-processing)", test_discard_api)
+                check("FastAPI smoke (/ /api/status /api/mods /api/export)", test_api_smoke)
+            finally:
+                # Windows cannot delete the temporary app.log while open.
+                for handler in set(logging.getLogger().handlers) - old_handlers:
+                    logging.getLogger().removeHandler(handler)
+                    handler.close()
 
     if FAILURES:
         print(f"\n{len(FAILURES)} FAILURE(S):")

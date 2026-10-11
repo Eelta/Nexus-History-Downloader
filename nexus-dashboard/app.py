@@ -160,22 +160,17 @@ async def refresh_job(force: bool = False) -> None:
         async with async_playwright() as pw:
             sc = runner()
             mods = await sc.run(pw, force_refresh=force)
-        if mods:
-            state.mods = mods
-            state.filter_stats = {
-                "game": config.TARGET_GAME,
-                "kept": len(mods),
-                "removed_old_downloads": sc.filter_removed,
-            }
-            state.last_refresh = time.strftime("%Y-%m-%d %H:%M:%S")
-            state.refresh_version += 1
-            state.refresh_error = None
-        else:
-            # 空扫描（页面视图未就绪/会话异常等）绝不覆盖已有列表：
-            # 保留上次数据，仅记日志，避免“好数据变暂无数据”
-            log.warning("scan returned 0 mods - keeping previous list (%d items)",
-                        len(state.mods))
-            state.refresh_error = None
+        # A successful scan may have no outstanding updates. Collection
+        # failures raise instead, so only that exception path keeps old data.
+        state.mods = mods
+        state.filter_stats = {
+            "game": config.TARGET_GAME,
+            "kept": len(mods),
+            "removed_old_downloads": sc.filter_removed,
+        }
+        state.last_refresh = time.strftime("%Y-%m-%d %H:%M:%S")
+        state.refresh_version += 1
+        state.refresh_error = None
     except Exception as exc:
         log.exception("refresh failed")
         state.refresh_error = str(exc)

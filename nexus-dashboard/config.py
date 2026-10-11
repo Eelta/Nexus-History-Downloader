@@ -44,11 +44,11 @@ HISTORY_URL = "https://www.nexusmods.com/users/myaccount?tab=download+history"
 LOGIN_URL = "https://users.nexusmods.com/login"
 
 # bump on each code change so the dashboard footer shows the running version
-APP_VERSION = "2.34"
+APP_VERSION = "2.36"
 
 # --- collection behaviour ---------------------------------------------------
 DEFAULT_MAX_HISTORY = None    # None = 抓取全部下载历史（不限制条数），再由
-                              # 「更新日期 ≥ 下载日期」筛选出已下载但有更新的模组
+                              # 「更新日期 ≥ 最近下载日期」筛选出已下载但有更新的模组
 TARGET_GAME = "skyrimspecialedition"  # only read Skyrim Special Edition mods
 MAX_LOGIN_WAIT_MINUTES = 10    # how long the interactive login flow waits
 MAX_LOAD_MORE_CLICKS = 250     # safety cap for history-page pagination rounds

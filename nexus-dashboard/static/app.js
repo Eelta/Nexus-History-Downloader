@@ -218,7 +218,7 @@ async function refreshStatus(showNotice = true) {
   $("countChip").textContent = `模组: ${st.mods_count}`;
   const fs = st.filter_stats;
   $("filterChip").textContent = fs && fs.game
-    ? `筛选: ${fs.game === "skyrimspecialedition" ? "Skyrim SE" : fs.game} · 保留(更新≥下载) ${fs.kept || 0} · 去除 ${fs.removed_old_downloads || 0}`
+    ? `筛选: ${fs.game === "skyrimspecialedition" ? "Skyrim SE" : fs.game} · 保留(更新≥最近下载) ${fs.kept || 0} · 去除 ${fs.removed_old_downloads || 0}`
     : "筛选: -";
   $("refreshChip").textContent = st.demo ? "数据: 演示数据" : `更新: ${st.last_refresh || "-"}`;
   $("demoBadge").classList.toggle("hidden", !st.demo);

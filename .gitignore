@@ -22,5 +22,8 @@ data/
 build/
 dist/
 
+# local installed application and browser profile
+/NHD/
+
 # local machine settings (download dir etc.) - never upload
 settings.json

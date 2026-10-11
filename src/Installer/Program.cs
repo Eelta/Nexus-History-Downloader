@@ -25,35 +25,17 @@ internal static class Program
         }
         if (dirArg is not null)                               // 控制面板 / 静默卸载
         {
-            return Uninstall(Path.GetFullPath(dirArg).TrimEnd('\\', '/'));
-        }
-        if (Path.GetFileName(Environment.ProcessPath ?? "").Equals("Uninstall.exe", StringComparison.OrdinalIgnoreCase))
-        {
-            // 双击 Uninstall.exe：自动定位安装位置，确认后卸载
-            string dir = LocateInstallDir();
-            if (MessageBox.Show(
-                    "确定要卸载 Nexus History Downloader 吗？\n卸载将删除安装文件夹中的全部内容（含下载文件与登录会话）。",
-                    "卸载", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            var start = new ProcessStartInfo(Path.Combine(Path.GetFullPath(dirArg), "Uninstall.exe"))
             {
-                return Uninstall(dir);
-            }
-            return 0;
+                UseShellExecute = false,
+            };
+            start.ArgumentList.Add("--uninstall");
+            start.ArgumentList.Add(Path.GetFullPath(dirArg));
+            using var process = Process.Start(start);
+            return process is null ? 1 : 0;
         }
         Application.Run(new SetupWizard());
         return 0;
-    }
-
-    private static string LocateInstallDir()
-    {
-        string dir = AppContext.BaseDirectory;
-        try
-        {
-            using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(UninstallKey);
-            var loc = k?.GetValue("InstallLocation") as string;
-            if (!string.IsNullOrWhiteSpace(loc)) dir = loc;
-        }
-        catch { }
-        return Path.GetFullPath(dir).TrimEnd('\\', '/');
     }
 
     private static int InstallSilent(string dir, bool shortcut)
@@ -68,12 +50,18 @@ internal static class Program
         target = Path.Combine(dir, AppName + ".exe");
         try
         {
+            ValidateInstallDirectory(dir);
+            dir = Path.GetFullPath(dir);
+            target = Path.Combine(dir, AppName + ".exe");
+            using var uninstaller = typeof(Program).Assembly.GetManifestResourceStream("NHD.Uninstaller.exe")
+                ?? throw new InvalidDataException("缺少卸载组件，请使用 build-exe.cmd 重新构建安装包。");
             ExtractApp(target);
-            File.Copy(Self(), Path.Combine(dir, "Uninstall.exe"), true);
+            using (var output = File.Create(Path.Combine(dir, "Uninstall.exe")))
+                uninstaller.CopyTo(output);
             if (shortcut) CreateShortcut(target, dir);
             using var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(UninstallKey);
             k.SetValue("DisplayName", "Nexus History Downloader");
-            k.SetValue("DisplayVersion", "2.35");
+            k.SetValue("DisplayVersion", "2.36");
             k.SetValue("InstallLocation", dir);
             k.SetValue("DisplayIcon", target);
             k.SetValue("UninstallString", $"\"{Path.Combine(dir, "Uninstall.exe")}\" --uninstall \"{dir}\"");
@@ -87,25 +75,19 @@ internal static class Program
         }
     }
 
-    private static int Uninstall(string dir)
+    internal static void ValidateInstallDirectory(string path)
     {
-        try
-        {
-            var lnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                                   AppName + ".lnk");
-            if (File.Exists(lnk)) File.Delete(lnk);
-            Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false);
-            // 延迟删除安装目录（本进程退出后由 cmd 完成）
-            Process.Start(new ProcessStartInfo(
-                "cmd.exe", $"/c ping -n 2 127.0.0.1 >nul & rmdir /s /q \"{dir}\"")
-            { UseShellExecute = false, CreateNoWindow = true });
-            return 0;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("UNINSTALL_FAIL " + ex.Message);
-            return 1;
-        }
+        if (!Path.IsPathFullyQualified(path))
+            throw new InvalidOperationException("安装路径必须是本地绝对路径。");
+        var dir = new DirectoryInfo(Path.GetFullPath(path));
+        if (dir.FullName.StartsWith(@"\\", StringComparison.Ordinal))
+            throw new InvalidOperationException("安装路径必须是本地绝对路径。");
+        if (dir.Parent is null || !dir.Name.Equals(AppName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("安装文件夹必须命名为 NHD。");
+        // Match the uninstaller's path restrictions before creating any files.
+        for (DirectoryInfo? current = dir; current is not null; current = current.Parent)
+            if (current.Exists && (current.Attributes & FileAttributes.ReparsePoint) != 0)
+                throw new InvalidOperationException("安装路径包含目录链接，请选择真实的本地安装路径。");
     }
 
     /// <summary>规范化安装位置：末段是 NHD 则用之，否则自动补 \NHD。</summary>

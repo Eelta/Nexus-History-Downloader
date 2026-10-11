@@ -19,8 +19,9 @@ set "HOST_OUT=%BUILD%\_host_publish"
 set "BACKEND_OUT=%BUILD%\_backend_publish"
 set "SHELL_OUT=%BUILD%\_shell_publish"
 set "SETUP_OUT=%BUILD%\_setup_publish"
+set "UNINSTALL_OUT=%BUILD%\_uninstaller_publish"
 
-echo [1/6] Preparing Python environment ...
+echo [1/7] Preparing Python environment ...
 if not exist "%VENV_PY%" (
   where py >nul 2>nul
   if not errorlevel 1 (py -3 -m venv "%~dp0nexus-dashboard\.venv") else (python -m venv "%~dp0nexus-dashboard\.venv")
@@ -31,12 +32,12 @@ if errorlevel 1 goto :fail
 "%VENV_PY%" -m pip install -r "%~dp0nexus-dashboard\requirements.txt" pyinstaller
 if errorlevel 1 goto :fail
 
-echo [2/6] Building C# download host (win-x64 self-contained single file) ...
+echo [2/7] Building C# download host (win-x64 self-contained single file) ...
 if exist "%HOST_OUT%" rmdir /s /q "%HOST_OUT%"
 dotnet publish "%~dp0src\Downloader.Host\Downloader.Host.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "%HOST_OUT%"
 if errorlevel 1 goto :fail
 
-echo [3/6] Packaging Python backend (nexus-backend, host embedded) ...
+echo [3/7] Packaging Python backend (nexus-backend, host embedded) ...
 if exist "%BACKEND_OUT%" rmdir /s /q "%BACKEND_OUT%"
 "%VENV_PY%" -m PyInstaller --noconfirm --clean --onefile --console ^
   --name nexus-backend ^
@@ -48,17 +49,29 @@ if exist "%BACKEND_OUT%" rmdir /s /q "%BACKEND_OUT%"
   "%~dp0nexus-dashboard\app.py"
 if errorlevel 1 goto :fail
 
-echo [4/6] Building desktop app shell (WebView2) ...
+echo [4/7] Building desktop app shell (WebView2) ...
 if exist "%SHELL_OUT%" rmdir /s /q "%SHELL_OUT%"
 dotnet publish "%~dp0src\AppShell\AppShell.csproj" -c Release -r win-x64 --self-contained true ^
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "%SHELL_OUT%"
 if errorlevel 1 goto :fail
 
-echo [5/6] Assembling app: NHD.exe = shell + backend payload ...
+echo [5/7] Assembling app: NHD.exe = shell + backend payload ...
 powershell -NoProfile -Command "$o=[IO.File]::Create('%BUILD%\NHD.exe');$s=[IO.File]::OpenRead('%SHELL_OUT%\NHD.exe');$s.CopyTo($o);$s.Close();$p=[IO.File]::OpenRead('%BACKEND_OUT%\nexus-backend.exe');$l=$p.Length;$p.CopyTo($o);$p.Close();$o.Write([BitConverter]::GetBytes([int64]$l),0,8);$m=[Text.Encoding]::ASCII.GetBytes('NEXUSPAYLOAD');$o.Write($m,0,$m.Length);$o.Close()"
 if errorlevel 1 goto :fail
 
-echo [6/6] Building installer and assembling NHD.exe ...
+echo [6/7] Building lightweight uninstaller (Windows .NET Framework) ...
+set "FRAMEWORK_CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if not exist "%FRAMEWORK_CSC%" set "FRAMEWORK_CSC=%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe"
+if not exist "%FRAMEWORK_CSC%" (
+  echo Windows .NET Framework compiler was not found.
+  goto :fail
+)
+if not exist "%UNINSTALL_OUT%" mkdir "%UNINSTALL_OUT%"
+"%FRAMEWORK_CSC%" /nologo /target:winexe /optimize+ /platform:anycpu /codepage:65001 /reference:System.Windows.Forms.dll ^
+  /win32icon:"%~dp0assets\icon.ico" /out:"%UNINSTALL_OUT%\Uninstall.exe" "%~dp0src\Uninstaller\Program.cs"
+if errorlevel 1 goto :fail
+
+echo [7/7] Building installer and assembling NHD.exe ...
 if exist "%SETUP_OUT%" rmdir /s /q "%SETUP_OUT%"
 dotnet publish "%~dp0src\Installer\Installer.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o "%SETUP_OUT%"
 if errorlevel 1 goto :fail
@@ -71,6 +84,7 @@ if exist "%HOST_OUT%" rmdir /s /q "%HOST_OUT%"
 if exist "%BACKEND_OUT%" rmdir /s /q "%BACKEND_OUT%"
 if exist "%SHELL_OUT%" rmdir /s /q "%SHELL_OUT%"
 if exist "%SETUP_OUT%" rmdir /s /q "%SETUP_OUT%"
+if exist "%UNINSTALL_OUT%" rmdir /s /q "%UNINSTALL_OUT%"
 
 echo.
 echo Build done: %DIST%\NHD.exe  (single install package)
@@ -82,4 +96,4 @@ goto :eof
 :fail
 echo.
 echo BUILD FAILED - see errors above.
-exit /b 1
+exit /b 1

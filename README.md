@@ -5,7 +5,7 @@
 ## Features
 
 - **Standalone desktop UI**: No browser needed — the app loads a local dashboard in its own window;
-- **Update monitoring**: One login scans all of your Nexus Mods download history, automatically filters for mods that are "already downloaded and have updates", and loads the full list at once (no pagination);
+- **Update monitoring**: One login scans all of your Nexus Mods download history, compares each update with the most recent download, and excludes mods downloaded after the update; caches using the previous timezone format are automatically invalidated and rescanned, and the full list loads at once (no pagination);
 - **Multi-threaded downloads**: A PCL-equivalent engine using segmented HTTP Range parallel downloads (64 connections by default), automatically falling back to a single thread when the source does not support Range;
 - **Download takeover**: Clicking a mod name opens a controlled browser window (using your real login session); every Nexus Mods download in that window is automatically handed off to the engine;
 - **Zero maintenance**: Caches are cleaned up automatically (leftover chunks, pip cache, capped log length).
@@ -29,6 +29,8 @@ build-exe.cmd
 2. After installation, run `NHD.exe` from that folder (the app and its cache data stay in the same folder);
 3. It is registered as a Windows app: you can uninstall it via Settings → Apps (this deletes everything in the installation folder — please confirm before uninstalling).
 
+The uninstaller uses Windows' built-in .NET Framework and PowerShell and occupies only a few tens of KB, without copying the entire installer package.
+
 ## First Use
 
 1. After opening the app, click "Browser Login" on the page and log in once with a real Edge/Chrome profile (only the Nexus Mods session is saved; no passwords are stored);
@@ -50,6 +52,7 @@ src\Downloader.Core    Download engine
 src\Downloader.Host    Download host (HTTP service, called by the dashboard)
 src\AppShell           Desktop shell (WebView2 window, includes backend extraction)
 src\Installer          Installer (GUI wizard + uninstall registration)
+src\Uninstaller        Lightweight uninstaller (uses the Windows runtime)
 nexus-dashboard\       FastAPI dashboard (Python backend)
 tests\                 Engine self-checks
 dist\                  Build output (NHD.exe)

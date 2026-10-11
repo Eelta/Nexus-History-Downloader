@@ -39,9 +39,15 @@ MOD_HREF_RE = re.compile(
     r"(?:nexusmods\.com/)?([a-z0-9_-]+)/mods/(\d+)", re.I
 )
 HISTORY_XHR_RE = re.compile(r"(history|download|myaccount|widget)", re.I)
-DATE_RE = re.compile(
-    r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}(?:,\s*\d{1,2}:\d{2}\s*[APap][Mm])?)"
+_TIME_SUFFIX = (
+    r"(?:[T\s,]+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:\s*[APap][Mm])?"
+    r"(?:\s*(?:UTC|GMT|BST|CET|CEST|EST|EDT|Z|[+-]\d{2}:?\d{2}))?)?"
 )
+DATE_RE = re.compile(r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}" + _TIME_SUFFIX + r")")
+NUMERIC_DATE_RE = re.compile(r"\d{4}[/-]\d{1,2}[/-]\d{1,2}" + _TIME_SUFFIX)
+_DATE_TZINFOS = {"UTC": 0, "GMT": 0, "BST": 3600, "CET": 3600,
+                "CEST": 7200, "EST": -18000, "EDT": -14400}
 VERSION_RE = re.compile(r"v?\d+(?:\.\d+)+")
 CHANGELOG_HEADER_RE = re.compile(r"^\s*(?:version\s*)?v?\d+(?:\.\d+){1,3}\b", re.I)
 SIZE_RE = re.compile(r"([\d.,]+\s*(?:KB|MB|GB))\b", re.I)
@@ -55,7 +61,7 @@ AUTHOR_RE = re.compile(r"Author[:\s]*([^\n]+)", re.I)
 HISTORY_EXTRACT_JS = r"""
 () => {
   const hrefRe = /(?:nexusmods\.com\/|\/)([a-z0-9_-]+)\/mods\/(\d+)/i;
-  const seen = new Set();
+  const seen = new Map();
   const items = [];
   const looksHistory = (el) => !!(
     el.closest('[class*="history" i], [data-testid*="history" i], [id*="history" i]') ||
@@ -66,9 +72,12 @@ HISTORY_EXTRACT_JS = r"""
     if (!m) return;
     if (!looksHistory(a)) return;
     const key = m[1] + '/' + m[2];
-    if (seen.has(key)) return;
-    seen.add(key);
     const row = a.closest('tr') || a.closest('li,article,div');
+    // Deduplicate links within a row, never different downloads of a mod.
+    const rowKeys = seen.get(row) || new Set();
+    if (rowKeys.has(key)) return;
+    rowKeys.add(key);
+    seen.set(row, rowKeys);
     const cells = row
       ? Array.from(row.querySelectorAll('td'))
           .map((td) => (td.innerText || '').trim().slice(0, 200))
@@ -101,23 +110,22 @@ def parse_nexus_date(text: str | None):
     """
     if not text:
         return None
-    text = re.sub(r"\b(UTC|GMT|BST|CET|CEST|EST|EDT)\b", "", text).strip()
     text = re.sub(r"\s+", " ", text).strip(" ,;:·")
     # numeric slash/dash dates first - most current Nexus pages use them
-    m = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    m = NUMERIC_DATE_RE.search(text)
     if m:
         try:
-            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            pass
+            return dt_parser.parse(m.group(0), yearfirst=True, tzinfos=_DATE_TZINFOS)
+        except (dt_parser.ParserError, ValueError, OverflowError):
+            return None
     m = DATE_RE.search(text)
     if m:
         try:
-            return dt_parser.parse(m.group(1), fuzzy=True)
+            return dt_parser.parse(m.group(1), fuzzy=True, tzinfos=_DATE_TZINFOS)
         except (dt_parser.ParserError, ValueError, OverflowError):
             pass
     try:
-        return dt_parser.parse(text, fuzzy=True)
+        return dt_parser.parse(text, fuzzy=True, tzinfos=_DATE_TZINFOS)
     except (dt_parser.ParserError, ValueError, OverflowError):
         return None
 
@@ -180,12 +188,9 @@ def parse_mod_meta(soup: BeautifulSoup, page_text: str) -> dict:
             m = re.search(r"Last updated[:\s]*([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}[^|]*)", flat)
         meta["updated_raw"] = m.group(1).strip().rstrip("|") if m else ""
         # keep only the date token itself (raw text may contain "on 2026/8/27 by ...")
-        m2 = re.search(
-            r"\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",
-            meta["updated_raw"],
-        )
-        if m2:
-            meta["updated_raw"] = m2.group(0)
+        token = _find_date_token(meta["updated_raw"])
+        if token:
+            meta["updated_raw"] = token
         meta["updated_at"] = (
             _as_utc(parse_nexus_date(meta["updated_raw"])).isoformat()
             if parse_nexus_date(meta["updated_raw"]) else None
@@ -218,12 +223,34 @@ def parse_mod_meta(soup: BeautifulSoup, page_text: str) -> dict:
 def _find_date_token(row_text: str) -> str:
     """First date-looking token in a row: numeric (2026/8/27) or named
     month (03 May 2025, 8:07PM) format."""
-    m = re.search(
-        r"(\d{4}[/-]\d{1,2}[/-]\d{1,2})|"
-        r"(\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}(?:[^0-9]*\d{1,2}:\d{2}\s*[APap][Mm])?)",
-        row_text,
-    )
+    m = re.search(NUMERIC_DATE_RE.pattern + "|" + DATE_RE.pattern, row_text)
     return m.group(0) if m else ""
+
+
+def _history_date_tokens(item: dict) -> tuple[str, str]:
+    """Use the same Last DL / Updated values for filtering and display."""
+    cells = item.get("cells") or []
+    dl = _find_date_token(cells[1]) if len(cells) >= 2 else ""
+    up = _find_date_token(cells[4]) if len(cells) >= 5 else ""
+    if not cells:  # XHR-only entries may carry a download timestamp.
+        dl = _find_date_token(item.get("rowText", ""))
+    return dl, up
+
+
+def _merge_history_item(seen: dict[str, dict], entry: dict) -> bool:
+    """Keep the latest known download, regardless of row/page ordering."""
+    key = f"{entry['domain']}/{entry['mod_id']}"
+    old = seen.get(key)
+    if old is None:
+        seen[key] = entry
+        return True
+    old_dl = _as_utc(parse_nexus_date(_history_date_tokens(old)[0]))
+    new_dl = _as_utc(parse_nexus_date(_history_date_tokens(entry)[0]))
+    if new_dl and (old_dl is None or new_dl > old_dl):
+        seen[key] = entry
+    elif new_dl == old_dl and entry.get("cells") and not old.get("cells"):
+        seen[key] = entry
+    return False
 
 
 def _row_fields(row_text: str) -> dict:
@@ -430,9 +457,9 @@ def filter_old_downloads(mods: list[dict]) -> tuple[list[dict], int]:
     kept: list[dict] = []
     removed = 0
     for m in mods:
-        dl = m.get("downloaded_at")
-        up = m.get("updated_at")
-        if dl and up and str(dl) > str(up):
+        dl = _as_utc(parse_nexus_date(m.get("downloaded_at")))
+        up = _as_utc(parse_nexus_date(m.get("updated_at")))
+        if dl and up and dl > up:
             removed += 1
             continue
         kept.append(m)
@@ -479,32 +506,17 @@ def light_filter_items(items: list[dict]) -> tuple[list[dict], int]:
     """Phase-1 filter using ONLY the history-table dates (Last DL / Updated
     columns) so mods that would be filtered out are NEVER fully crawled.
 
-    ＜保留规则＞只要该模组有过「任意一次下载早于更新时间」，就说明存在你
-    没下载过的新版本 → 保留；只有当【最早一次下载也晚于更新】（从未有新
-    版本出现）时才剔除。Rows without both dates are kept.
+    Compare Updated with the LATEST download shown in the UI. Older downloads
+    do not imply an outstanding update after a newer download. Unknown dates
+    are kept conservatively.
     Returns (kept_items, removed_count).
     """
     kept: list[dict] = []
     removed = 0
     for it in items:
-        cells = it.get("cells") or []
-        up_tok = _find_date_token(cells[4]) if len(cells) >= 5 else ""
-        u = parse_nexus_date(up_tok)
-        uu = _as_utc(u) if u else None
-        # 最早一次下载时间（_earliest_dl 为 ISO 字符串；缺失时退用 Last DL 列）
-        dl = None
-        if it.get("_earliest_dl"):
-            try:
-                dl = datetime.fromisoformat(
-                    str(it["_earliest_dl"]).replace("Z", "+00:00"))
-                if dl.tzinfo is None:
-                    dl = dl.replace(tzinfo=timezone.utc)
-            except ValueError:
-                dl = None
-        if dl is None:
-            dl_tok = _find_date_token(cells[1]) if len(cells) >= 2 else ""
-            dd = parse_nexus_date(dl_tok)
-            dl = _as_utc(dd) if dd else None
+        dl_tok, up_tok = _history_date_tokens(it)
+        dl = _as_utc(parse_nexus_date(dl_tok))
+        uu = _as_utc(parse_nexus_date(up_tok))
         if dl and uu and dl > uu:
             removed += 1
             continue
@@ -600,6 +612,7 @@ class NexusScraper:
         self.filter_removed = 0   # mods dropped by the update-since-download rule
 
     def _load_scan_cache(self):
+        global TZ_OFFSET_MIN
         p = config.SCAN_CACHE_FILE
         if not p.is_file():
             return None
@@ -609,6 +622,10 @@ class NexusScraper:
                 return None
             if data.get("game") != config.TARGET_GAME:
                 return None
+            offset = data.get("timezone_offset_min")
+            if type(offset) is not int or not -840 <= offset <= 840:
+                return None
+            TZ_OFFSET_MIN = offset
             # 无时间缓存：是否重扫由 force 决定（每次启动/手动刷新都强制重扫）
             return data.get("items") or None
         except Exception:
@@ -619,6 +636,7 @@ class NexusScraper:
         config.SCAN_CACHE_FILE.write_text(json.dumps({
             "app_version": config.APP_VERSION,
             "game": config.TARGET_GAME,
+            "timezone_offset_min": TZ_OFFSET_MIN,
             "fetched_at": time.time(),
             "items": items,
         }, ensure_ascii=False, default=str), encoding="utf-8")
@@ -664,10 +682,7 @@ class NexusScraper:
         cells = item.get("cells") or []
         name = (cells[0] if cells else "").strip() \
             or item.get("name") or f"{domain}/{mod_id}"
-        up_tok = _find_date_token(cells[4]) if len(cells) >= 5 else ""
-        dl_tok = _find_date_token(cells[1]) if len(cells) >= 2 else ""
-        if not dl_tok:
-            dl_tok = _find_date_token(item.get("rowText", ""))
+        dl_tok, up_tok = _history_date_tokens(item)
         up_iso = (_as_utc(parse_nexus_date(up_tok)).isoformat()
                   if up_tok and parse_nexus_date(up_tok) else None)
         dl_iso = (_as_utc(parse_nexus_date(dl_tok)).isoformat()
@@ -696,7 +711,6 @@ class NexusScraper:
         page = await context.new_page()
         items: list[dict] = []
         seen: dict[str, dict] = {}
-        earliest: dict[str, object] = {}   # key -> 最早一次下载时间 (datetime|None)
         xhr_found: list[dict] = []
 
         async def on_response(resp):
@@ -728,6 +742,7 @@ class NexusScraper:
                         "href": e.get("url") or "",
                         "name": (e.get("name") or e.get("title") or e.get("modName") or ""),
                         "source": "xhr",
+                        "rowText": "",
                     }
                     # keep a download timestamp if the XHR payload carries one
                     for k in ("download_date", "downloaded_at", "built_on",
@@ -736,9 +751,7 @@ class NexusScraper:
                             rec["rowText"] = str(e[k])
                     if not rec.get("rowText"):
                         rec["rowText"] = ""
-                    if key not in seen:
-                        seen[key] = rec
-                        xhr_found.append(rec)
+                    xhr_found.append(rec)
             except Exception:
                 pass
 
@@ -835,12 +848,6 @@ class NexusScraper:
                 nonlocal hint_total, hint_entries
                 added = 0
 
-                def dl_time(ent):
-                    c = ent.get("cells") or []
-                    tok = _find_date_token(c[1]) if len(c) >= 2 else ""
-                    d = parse_nexus_date(tok)
-                    return _as_utc(d) if d else None
-
                 for h in res.get("hints") or []:
                     m = re.match(r"downloads:([\d,]+)", h)
                     if m and hint_total is None:
@@ -856,37 +863,16 @@ class NexusScraper:
                 for it in res.get("items") or []:
                     if it["domain"] != config.TARGET_GAME:
                         continue  # 只读取指定游戏的模组
-                    key = f"{it['domain']}/{it['modId']}"
                     c = it.get("cells") or []
-                    dl_tok = _find_date_token(c[1]) if len(c) >= 2 else ""
-                    d_this = parse_nexus_date(dl_tok)
-                    # 记录该模组“最早一次下载时间”：只要有一次下载早于
-                    # 更新时间，就说明存在你没下载过的新版本 → 保留
-                    old_earliest = earliest.get(key)
-                    d_aware = _as_utc(d_this) if d_this else None
-                    if old_earliest is None or (
-                            d_aware and old_earliest and d_aware < old_earliest):
-                        earliest[key] = d_aware if d_aware else old_earliest
                     entry = {
                         "domain": it["domain"], "mod_id": it["modId"],
                         "href": it["href"],
                         "rowText": it.get("rowText", ""),
                         "cells": c,
                         "source": "dom",
-                        "_earliest_dl": (earliest[key].isoformat()
-                                         if earliest[key] else ""),
                     }
-                    old = seen.get(key)
-                    if old is None:
-                        seen[key] = entry
+                    if _merge_history_item(seen, entry):
                         added += 1
-                    else:
-                        d_old = dl_time(old)
-                        d_new = dl_time(entry)
-                        # 展示用行：保留“最近一次下载”的那条；
-                        # 筛选用的最早下载时间单独记录在 _earliest_dl
-                        if d_new and (d_old is None or d_new > d_old):
-                            seen[key] = entry
                 items[:] = list(seen.values())
                 return added
 
@@ -1017,8 +1003,10 @@ class NexusScraper:
                 if rec["domain"] != config.TARGET_GAME:
                     continue  # 只读取指定游戏的模组
                 key = f"{rec['domain']}/{rec['mod_id']}"
-                if key not in seen:
-                    seen[key] = rec
+                # DOM has both Last DL and Updated columns. Prefer it over
+                # less complete XHR metadata; merge XHR-only duplicates.
+                if key not in seen or not seen[key].get("cells"):
+                    _merge_history_item(seen, rec)
             items[:] = list(seen.values())
             await page.close()
 
