@@ -21,6 +21,10 @@ from dateutil import parser as dt_parser
 from playwright.async_api import BrowserContext
 
 import config
+from history_page import (
+    HistoryNotReady, advance_history_page, configure_history_table, open_history,
+)
+from mo2 import atomic_json
 
 log = logging.getLogger("nexus.scraper")
 
@@ -633,13 +637,13 @@ class NexusScraper:
 
     def _save_scan_cache(self, items) -> None:
         config.ensure_dirs()
-        config.SCAN_CACHE_FILE.write_text(json.dumps({
+        atomic_json(config.SCAN_CACHE_FILE, {
             "app_version": config.APP_VERSION,
             "game": config.TARGET_GAME,
             "timezone_offset_min": TZ_OFFSET_MIN,
             "fetched_at": time.time(),
             "items": items,
-        }, ensure_ascii=False, default=str), encoding="utf-8")
+        })
 
     # ------------------------------------------------------------- pipeline
     async def run(self, playwright, force_refresh: bool = False) -> list[dict]:
@@ -755,265 +759,83 @@ class NexusScraper:
             except Exception:
                 pass
 
-        page.on("response", lambda r: asyncio.ensure_future(on_response(r)))
+        responses = set()
 
+        def receive_response(response):
+            task = asyncio.create_task(on_response(response))
+            responses.add(task)
+            task.add_done_callback(responses.discard)
+
+        page.on("response", receive_response)
+        hint_entries = None
+        completed = False
         try:
-            await page.goto(config.HISTORY_URL, wait_until="domcontentloaded",
-                            timeout=60_000)
-            # 实测本机时区偏移，用于把站点本地时间换算成 UTC
+            snapshot = await open_history(page, self.progress)
+            if snapshot["state"] == "empty":
+                raise RuntimeError("下载历史为空，已保留原记录")
             global TZ_OFFSET_MIN
+            TZ_OFFSET_MIN = int(await page.evaluate("new Date().getTimezoneOffset()"))
+            snapshot = await configure_history_table(page, snapshot)
+            sorted_by_update = snapshot.get("sorted", False)
+            started = time.monotonic()
+            visited = set()
+            for _round in range(config.MAX_LOAD_MORE_CLICKS):
+                if time.monotonic() - started > 300:
+                    raise HistoryNotReady("历史扫描未完成，已保留原记录；请稍后重试")
+                dt = snapshot.get("dt")
+                if dt:
+                    page_number = dt["page"]
+                    if page_number in visited:
+                        raise HistoryNotReady("历史分页未前进，已保留原记录")
+                    visited.add(page_number)
+                    hint_entries = dt["recordsDisplay"]
+                    await self.progress.set_progress(dt["end"], max(1, hint_entries))
+                result = await page.evaluate(HISTORY_EXTRACT_JS)
+                for item in result.get("items") or []:
+                    if item["domain"] != config.TARGET_GAME:
+                        continue
+                    _merge_history_item(seen, {
+                        "domain": item["domain"], "mod_id": item["modId"],
+                        "href": item["href"], "rowText": item.get("rowText", ""),
+                        "cells": item.get("cells") or [], "source": "dom",
+                    })
+                if self.max_history is not None and sorted_by_update and len(seen) >= self.max_history:
+                    completed = True
+                    break
+                snapshot = await advance_history_page(page, snapshot)
+                if snapshot is None:
+                    completed = True
+                    break
+            if not completed:
+                raise HistoryNotReady("历史页数超过扫描上限，已保留原记录")
+        except Exception:
+            # Keep a local diagnostic for incomplete pages. It never replaces
+            # the last successful scan or the player's archived mod records.
             try:
-                TZ_OFFSET_MIN = int(await page.evaluate(
-                    "new Date().getTimezoneOffset()"))
-                log.info("captured browser TZ offset: %d min (UTC%+d)",
-                         TZ_OFFSET_MIN, -TZ_OFFSET_MIN // 60)
+                config.ensure_dirs()
+                (config.CACHE_DIR / "history-debug.html").write_text(
+                    await page.content(), encoding="utf-8", errors="replace")
             except Exception:
                 pass
-            # initial render
-            for _ in range(3):
-                await page.wait_for_timeout(1200)
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(600)
-            # DataTables：把每页条数调到 200（不支持再 100），减少翻页次数
-            for length in ("200", "100"):
-                try:
-                    r = await page.evaluate(
-                        "() => { try { const t = $('#DataTables_Table_0')"
-                        ".DataTable(); t.page.len(" + length + ").draw(); "
-                        "return 'ok'; } catch (e) { return 'err:' + e.message; } }"
-                    )
-                    if str(r).startswith("ok"):
-                        await page.wait_for_timeout(1800)
-                        break
-                except Exception:
-                    pass
-            # 等表格真正渲染出数据（AJAX 未完成时空表会导致误判结束）
-            for _ in range(12):
-                res0 = await page.evaluate(HISTORY_EXTRACT_JS)
-                if any(it["domain"] == config.TARGET_GAME
-                       for it in (res0.get("items") or [])):
-                    break
-                await page.wait_for_timeout(1500)
-            # 让表格按「Updated」列降序排列（等效按更新时间排序），
-            # 这样只读前几页就能拿到最新更新的模组，不用翻完 17 页
-            sorted_by_update = False
-            try:
-                await page.evaluate(r"""
-                () => {
-                  const ths = Array.from(document.querySelectorAll('#DataTables_Table_0 th'));
-                  const th = ths.find(t => /updated/i.test(t.innerText || '')) || null;
-                  if (!th) return 'no-col';
-                  th.click();  // 第一次：升序
-                  return 'clicked';
-                }
-                """)
-                await page.wait_for_timeout(1500)
-                desc = await page.evaluate(r"""
-                () => {
-                  const ths = Array.from(document.querySelectorAll('#DataTables_Table_0 th'));
-                  const th = ths.find(t => /updated/i.test(t.innerText || '')) || null;
-                  return th ? /sorting_desc/i.test(th.className || '') : false;
-                }
-                """)
-                if not desc:
-                    await page.evaluate(r"""
-                    () => {
-                      const ths = Array.from(document.querySelectorAll('#DataTables_Table_0 th'));
-                      const th = ths.find(t => /updated/i.test(t.innerText || '')) || null;
-                      if (th) th.click();  // 第二次：降序
-                    }
-                    """)
-                    await page.wait_for_timeout(2500)
-                sorted_by_update = True
-                log.info("history table sorted by Updated desc")
-            except Exception as exc:
-                log.warning("could not sort by Updated column: %s",
-                            _exc_brief(exc))
-            # 等排序后重新渲染
-            for _ in range(12):
-                res0 = await page.evaluate(HISTORY_EXTRACT_JS)
-                if any(it["domain"] == config.TARGET_GAME
-                       for it in (res0.get("items") or [])):
-                    break
-                await page.wait_for_timeout(1200)
-            stale = 0
-            empty_pages = 0
-            scan_started = time.time()
-            hint_total: int | None = None
-            hint_entries: int | None = None
-
-            def absorb(res) -> int:
-                """把一次提取结果并入 seen（同一模组保留“最近一次下载”的行，
-                因为筛选要看最后一次下载时间），返回新增模组数。"""
-                nonlocal hint_total, hint_entries
-                added = 0
-
-                for h in res.get("hints") or []:
-                    m = re.match(r"downloads:([\d,]+)", h)
-                    if m and hint_total is None:
-                        hint_total = int(m.group(1).replace(",", ""))
-                        log.info("history page reports %d downloads", hint_total)
-                    m = re.match(r"entries:([\d,]+)", h)
-                    if m and hint_entries is None:
-                        hint_entries = int(m.group(1).replace(",", ""))
-                        if hint_total is None:
-                            hint_total = hint_entries
-                        log.info("history table has %d entries total",
-                                 hint_entries)
-                for it in res.get("items") or []:
-                    if it["domain"] != config.TARGET_GAME:
-                        continue  # 只读取指定游戏的模组
-                    c = it.get("cells") or []
-                    entry = {
-                        "domain": it["domain"], "mod_id": it["modId"],
-                        "href": it["href"],
-                        "rowText": it.get("rowText", ""),
-                        "cells": c,
-                        "source": "dom",
-                    }
-                    if _merge_history_item(seen, entry):
-                        added += 1
-                items[:] = list(seen.values())
-                return added
-
-            for _round in range(config.MAX_LOAD_MORE_CLICKS):
-                # 总时长护栏：分页机制异常时避免无限空转（如 API 每页都“ok”
-                # 但服务端已无更多行），120 秒后强制结束，任务照常完成
-                if time.time() - scan_started > 120:
-                    log.warning("历史页扫描超时护栏(120s)：已取 %d/%d 条，提前结束",
-                                len(items), hint_entries or 0)
-                    break
-                absorb(await page.evaluate(HISTORY_EXTRACT_JS))
-                # 页面声明了下载总条数时，实时上报百分比（前端历史页阶段显示进度）
-                if hint_entries and hint_entries > 0:
-                    await self.progress.set_progress(
-                        min(len(items), hint_entries), hint_entries)
-                if self.max_history is not None and sorted_by_update and len(items) >= self.max_history:
-                    break  # 达到按更新时间排序的条数上限即停；None = 抓全部（靠 hint/翻页结束）
-                if hint_entries and hint_entries > 0 \
-                        and len(items) >= hint_entries:
-                    break  # 已经拿全页面声明的下载条数
-                before = len(items)
-                # DataTables 历史表：尝试用官方 API 翻下一页（最稳），
-                # 失败则点 .paginate_button 的 Next/» 控件
-                next_ok = False
-                try:
-                    r = await page.evaluate(
-                        "() => { try { const t = $('#DataTables_Table_0')"
-                        ".DataTable(); if (t.page.len() < 100) { "
-                        "t.page.len(100).draw(); } "
-                        "t.page('next').draw(false); "
-                        "return 'ok'; } catch (e) { return 'err:' + e.message; } }"
-                    )
-                    next_ok = str(r).startswith("ok")
-                except Exception:
-                    pass
-                if not next_ok:
-                    try:
-                        for btn in await page.query_selector_all(
-                                "[class*='paginate']"):
-                            text = (await btn.inner_text() or "").strip()
-                            if re.search(r"next|»|›|>", text, re.I):
-                                await btn.click(timeout=2000)
-                                next_ok = True
-                                break
-                    except Exception:
-                        pass
-                if next_ok:
-                    # 等待新页数据真正渲染（AJAX 未返回就再翻页会互相打断）
-                    grew = False
-                    for _w in range(2):   # AJAX 渲染等待：2 轮足够，避免空翻页时单轮 9.6s 的“卡住”感
-                        await page.wait_for_timeout(1200)
-                        if absorb(await page.evaluate(HISTORY_EXTRACT_JS)) > 0:
-                            grew = True
-                            break
-                    if not grew:
-                        stale += 1
-                        empty_pages += 1
-                        if empty_pages >= 2:
-                            log.info("连续 %d 页无新条目：历史页已到末尾（已取 %d 条），提前收尾",
-                                     empty_pages, len(items))
-                            break
-                    else:
-                        empty_pages = 0
-                    continue
-                # 兼容非 DataTables 结构：旧式“加载更多”按钮
-                clicked = False
-                try:
-                    buttons = await page.query_selector_all(
-                        "button, a.btn, a[role=button], [class*='load-more'], "
-                        "[class*='loadMore']")
-                except Exception as exc:
-                    log.warning("broad load-more selector failed: %s",
-                                _exc_brief(exc))
-                    buttons = []
-                for btn in buttons:
-                    try:
-                        text = (await btn.inner_text() or "").strip()
-                    except Exception:
-                        continue
-                    if text and len(text) < 60 and re.search(
-                            r"load more|show more|view more|加载更多|下一页",
-                            text, re.I):
-                        try:
-                            await btn.click(timeout=2500)
-                            clicked = True
-                            await page.wait_for_timeout(1600)
-                            break
-                        except Exception:
-                            pass
-                if clicked:
-                    continue
-                if len(items) == before:
-                    stale += 1
-                if stale >= 3:
-                    log.info("历史页分页连续 %d 轮无新条目，提前结束（已取 %d 条，声明 %s 条）",
-                             stale, len(items), hint_entries or "-")
-                    break
+            raise
         finally:
-            # 现场取证：把历史页 DOM 与"加载控件"清单存盘供排查分页机制
-            try:
-                html_dump = await page.content()
-                (config.CACHE_DIR / "history-debug.html").write_text(
-                    html_dump, encoding="utf-8", errors="replace")
-                controls = await page.evaluate(r"""
-                () => {
-                  const out = [];
-                  document.querySelectorAll('*').forEach((el) => {
-                    if (el.children.length > 4) return;
-                    let t = '';
-                    try { t = (el.innerText || '').trim(); } catch (e) {}
-                    if (t && t.length < 40 && /load|more|next|older|page|下一页|加载|view/i.test(t)) {
-                      let cls = '';
-                      try { cls = String(el.className || '').slice(0, 60); } catch (e) {}
-                      out.push(el.tagName + '.' + cls + ' :: ' + t);
-                    }
-                  });
-                  return [...new Set(out)].slice(0, 80);
-                }
-                """)
-                (config.CACHE_DIR / "history-controls.txt").write_text(
-                    "\n".join(controls), encoding="utf-8")
-                log.info("history debug dumped (%d controls)",
-                         len(controls or []))
-            except Exception as exc:
-                log.warning("history debug dump failed: %s", _exc_brief(exc))
-            # merge xhr-found entries (keeps items we couldn't see in DOM)
-            for rec in xhr_found:
-                if rec["domain"] != config.TARGET_GAME:
-                    continue  # 只读取指定游戏的模组
-                key = f"{rec['domain']}/{rec['mod_id']}"
-                # DOM has both Last DL and Updated columns. Prefer it over
-                # less complete XHR metadata; merge XHR-only duplicates.
-                if key not in seen or not seen[key].get("cells"):
-                    _merge_history_item(seen, rec)
-            items[:] = list(seen.values())
+            page.remove_listener("response", receive_response)
+            if responses:
+                _, pending = await asyncio.wait(responses, timeout=2)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
             await page.close()
 
+        # Only merge additional metadata after every requested page completed.
+        for rec in xhr_found:
+            key = f"{rec['domain']}/{rec['mod_id']}"
+            if key not in seen or not seen[key].get("cells"):
+                _merge_history_item(seen, rec)
+        items = list(seen.values())
         if not items:
             raise RuntimeError(
-                f"下载历史中没有找到游戏「{config.TARGET_GAME}」的模组："
-                "可能登录态已失效、该游戏没有下载记录，或页面结构发生变化。"
+                f"历史已加载，但没有游戏「{config.TARGET_GAME}」的下载记录；已保留原记录"
             )
         # 按「模组更新时间」取最新 max_history 条（不是按下载时间）
         def _up_key(it) -> str:

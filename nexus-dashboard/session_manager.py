@@ -10,13 +10,15 @@ import os
 import subprocess
 import sys
 import time
+import uuid
+from urllib.parse import urlsplit
 
 import config
 
 log = logging.getLogger("nexus.session")
 
 
-def _browser_channels() -> list[str]:
+def _browser_channels(preferred: str | None = None) -> list[str]:
     """System browsers only: Edge or Chrome are both prerequisites.
 
     The bundled chromium is intentionally never used or downloaded.
@@ -25,14 +27,51 @@ def _browser_channels() -> list[str]:
     forced = (os.environ.get("NEXUS_BROWSER") or "").strip().lower()
     if forced in ("msedge", "chrome"):
         return [forced]
-    return ["msedge", "chrome"] if sys.platform == "win32" else ["chrome"]
+    channels = ["msedge", "chrome"] if sys.platform == "win32" else ["chrome"]
+    if preferred in ("msedge", "chrome"):
+        channels = [preferred] + [channel for channel in channels if channel != preferred]
+    return channels
 
-IS_LOGGED_IN_JS = """
+
+def _is_nexus_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or "").lower()
+        return parsed.scheme in ("http", "https") and (host == "nexusmods.com" or host.endswith(".nexusmods.com"))
+    except ValueError:
+        return False
+
+
+def _safe_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        return parsed.scheme + "://" + parsed.netloc + parsed.path
+    except ValueError:
+        return "<unavailable>"
+
+
+def _atomic_json(path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+IS_LOGGED_IN_JS = r"""
 () => {
+  const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+    && getComputedStyle(el).visibility !== 'hidden';
   const hrefs = Array.from(document.querySelectorAll('a[href]')).map(a => a.href || '');
-  const hasAccountLink = hrefs.some(h => /users\\/myaccount/i.test(h));
-  const hasLoginForm = !!document.querySelector('input[type=password]');
-  return { ok: hasAccountLink, hasLoginForm };
+  const hasAccountLink = hrefs.some(h => /https?:\/\/([\w-]+\.)?nexusmods\.com\/users\/myaccount(?:[/?#]|$)/i.test(h));
+  const hasLoginForm = Array.from(document.querySelectorAll('input[type=password]')).some(visible);
+  const hasUserInput = !!document.activeElement?.matches('input:not([type=hidden]), textarea, [contenteditable=true]');
+  const text = document.body ? document.body.innerText.trim() : '';
+  const challenge = /just a moment|checking your browser|verify (?:that )?you are human|sorry, you have been blocked/i.test(document.title + ' ' + text.slice(0, 2000));
+  const loading = visible(document.querySelector('#history_loading'));
+  const ready = document.readyState !== 'loading' && text.length > 40 && !challenge && !loading;
+  return { ok: ready && hasAccountLink && !hasLoginForm, hasLoginForm, hasUserInput, ready, challenge };
 }
 """
 
@@ -41,9 +80,9 @@ class SessionManager:
     """Owns the Playwright context built from a persisted storage state.
 
     flow:
-      1. if `session.json` exists -> restore it and verify the login marker;
-      2. if verification fails or the file is missing -> open a *headed*
-         browser, let the human log in once, then persist the state.
+      1. restore saved state and verify the login marker in the background;
+      2. if verification fails, preserve state and show a retry/login message;
+      3. only an explicit login action opens an interactive profile window.
     """
 
     def __init__(self, session_file=config.SESSION_FILE,
@@ -53,6 +92,7 @@ class SessionManager:
         self.max_wait_minutes = max_wait_minutes
         self.login_url = login_url
         self.verify_url = verify_url
+        self._verification_problem = "page_unready"
 
     # ------------------------------------------------------------------ api
     def has_session(self) -> bool:
@@ -69,14 +109,13 @@ class SessionManager:
             return {"ok": False, "reason": f"unreadable: {exc}"}
 
     async def _launch(self, playwright, headless: bool = False):
-        """Launch a browser: prefer installed Edge/Chrome (no download),
-        fall back to Playwright's bundled chromium.
+        """Launch an installed Edge/Chrome, preferring the saved session browser.
 
         Automation-fingerprint masking is applied so anti-bot checks
         (Cloudflare etc.) are less likely to flag the instance.
         """
         last_err: Exception | None = None
-        for channel in _browser_channels():
+        for channel in _browser_channels(self._load_channel()):
             kw = {
                 "headless": headless,
                 "args": [
@@ -120,6 +159,54 @@ class SessionManager:
             pass
         return None
 
+    def _load_channel(self) -> str | None:
+        try:
+            raw = json.loads(config.SESSION_META_FILE.read_text(encoding="utf-8"))
+            channel = raw.get("browser_channel")
+            if channel in ("msedge", "chrome"):
+                return channel
+            # Older saved sessions recorded only the originating user agent.
+            # Reuse that browser without forcing a fresh login after upgrade.
+            user_agent = str(raw.get("user_agent") or "")
+            if "Edg/" in user_agent:
+                return "msedge"
+            if "Chrome/" in user_agent:
+                return "chrome"
+            return None
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    async def _auth_page_state(self, page) -> dict:
+        if not _is_nexus_url(str(page.url or "")):
+            return {"ok": False, "ready": False, "hasLoginForm": False}
+        try:
+            result = await page.evaluate(IS_LOGGED_IN_JS)
+            return result if isinstance(result, dict) else {"ok": False, "ready": False}
+        except Exception:
+            return {"ok": False, "ready": False, "hasLoginForm": False}
+
+    async def _logged_in_anywhere(self, context) -> bool:
+        for page in context.pages:
+            state = await self._auth_page_state(page)
+            if state.get("ok") and not state.get("hasLoginForm") and state.get("ready"):
+                return True
+        return False
+
+    async def _retry_incomplete_login_pages(self, context, reload_counts) -> None:
+        for page in context.pages:
+            state = await self._auth_page_state(page)
+            key = id(page)
+            if (not _is_nexus_url(str(page.url or ""))
+                    or state.get("hasLoginForm") or state.get("ready")
+                    or state.get("challenge") or state.get("hasUserInput")
+                    or reload_counts.get(key, 0) >= 2):
+                continue
+            reload_counts[key] = reload_counts.get(key, 0) + 1
+            try:
+                await page.reload(wait_until="domcontentloaded", timeout=30_000)
+            except Exception as exc:
+                log.warning("login page retry failed: %s", type(exc).__name__)
+
     async def _new_context(self, browser, storage_state=None):
         """Context with the UA of the imported session + fingerprint masking."""
         kw: dict = {}
@@ -144,38 +231,39 @@ class SessionManager:
         if force_login or not self.has_session():
             raise RuntimeError("尚未登录：请在仪表盘点击「浏览器登录」完成一次登录。")
 
-        # 1) headless verify - no window pops up for a valid stored session
+        # Scanning always stays in the background. Only the explicit login
+        # action may open the interactive browser/profile window.
+        self._verification_problem = "page_unready"
         browser = await self._launch(playwright, headless=True)
+        context = None
+        verified = False
         try:
             context = await self._new_context(
                 browser, storage_state=self.session_file)
             if await self._verify(context):
+                verified = True
                 log.info("session restored and verified (headless)")
                 return browser, context
-            log.warning("headless verification failed, retrying headed")
+            log.warning("background verification could not confirm a ready signed-in page")
         except Exception as exc:
-            log.warning("session restore (headless) failed: %s", exc)
-        await browser.close()
+            log.warning("background session restore failed: %s", type(exc).__name__)
+        finally:
+            if not verified:
+                if context is not None:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
-        # 2) headed verify - brief visible window, still no login needed
-        try:
-            browser = await self._launch(playwright, headless=False)
-            context = await self._new_context(
-                browser, storage_state=self.session_file)
-            if await self._verify(context):
-                log.info("session restored and verified (headed)")
-                return browser, context
-            log.warning("headed verification failed - session expired")
-            await context.close()
-        except Exception as exc:
-            log.warning("session restore (headed) failed: %s", exc)
-        try:
-            await browser.close()
-        except Exception:
-            pass
-
-        # 3) session really gone - ask for manual login (never auto-open)
-        raise RuntimeError("N 网会话已失效：请在仪表盘点击「浏览器登录」重新登录。")
+        if self._verification_problem == "login_required":
+            raise RuntimeError("请在仪表盘点击「登录」重新登录 N 网。")
+        if self._verification_problem == "challenge":
+            raise RuntimeError("N 网需要浏览器验证，请点击「登录」完成验证；原登录信息已保留。")
+        raise RuntimeError("N 网页面未完整加载，请稍后重试；原登录信息已保留。")
 
     # ------------------------------------------- real-browser-profile login
     def _profile_dirs(self) -> list[tuple[str, str]]:
@@ -296,7 +384,7 @@ class SessionManager:
 
             def on_nexus(p) -> bool:
                 try:
-                    return "nexusmods.com" in (p.url or "")
+                    return _is_nexus_url(p.url or "")
                 except Exception:
                     return False
 
@@ -313,7 +401,7 @@ class SessionManager:
             # about:blank / newtab - open a fresh tab and navigate there
             if not on_nexus(page):
                 log.info("first tab stuck on %s - retrying on a new tab",
-                         page.url or "about:blank")
+                         _safe_url(page.url or "about:blank"))
                 try:
                     page2 = await context.new_page()
                     await page2.goto(config.SITE,
@@ -351,28 +439,10 @@ class SessionManager:
                     await page.wait_for_timeout(2000)
                 except Exception as exc:
                     log.warning("reload after stuck tab failed: %s", exc)
-            log.info("real-profile window url=%s", page.url)
+            log.info("real-profile window url=%s", _safe_url(page.url))
 
             async def logged_in_anywhere() -> bool:
-                # DOM marker in any tab ...
-                for p in context.pages:
-                    try:
-                        res = await p.evaluate(IS_LOGGED_IN_JS)
-                        if res and res.get("ok"):
-                            return True
-                    except Exception:
-                        continue
-                # ... or nexus auth cookies present anywhere
-                try:
-                    for d in ("https://www.nexusmods.com",
-                              "https://users.nexusmods.com"):
-                        names = " ".join(
-                            c["name"].lower() for c in await context.cookies(d))
-                        if "sid_" in names or "jwt" in names:
-                            return True
-                except Exception:
-                    pass
-                return False
+                return await self._logged_in_anywhere(context)
 
             if not await logged_in_anywhere():
                 log.info("not logged in yet - entering login wait")
@@ -394,16 +464,21 @@ class SessionManager:
                     pass
                 deadline = time.monotonic() + max_wait_minutes * 60
                 iters = 0
+                reload_counts = {}
                 while time.monotonic() < deadline:
                     iters += 1
                     if await logged_in_anywhere():
-                        log.info("login detected (DOM marker or nexus auth cookie)")
+                        log.info("login detected from ready Nexus page")
                         break
+                    if iters % 5 == 0:
+                        # Retry incomplete Nexus shells, but never navigate
+                        # away from a form while the player is logging in.
+                        await self._retry_incomplete_login_pages(context, reload_counts)
                     if iters % 15 == 0:
                         urls = []
                         for p in context.pages:
                             try:
-                                urls.append(str(p.url or "")[:120])
+                                urls.append(_safe_url(str(p.url or ""))[:120])
                             except Exception:
                                 urls.append("<closed>")
                         log.info("waiting for login - tabs: %s", urls)
@@ -433,7 +508,7 @@ class SessionManager:
                 except Exception:
                     continue
             count = await self._save_session_from_context(
-                context, ua, "real-profile")
+                context, ua, "real-profile", browser_channel=channel)
             log.info("saved nexus session from real profile (%d cookies) - "
                      "closing window", count)
             return count
@@ -447,10 +522,12 @@ class SessionManager:
             await context.close()
 
     async def _save_session_from_context(self, context, ua: str,
-                                         source: str) -> int:
+                                         source: str, browser_channel: str | None = None) -> int:
         """Persist ONLY nexus-related cookies (privacy-first).
 
         Returns the number of persisted cookies."""
+        if not await self._logged_in_anywhere(context):
+            raise RuntimeError("N 网登录尚未完成，原登录信息已保留。")
         nexus_domains = [
             "https://www.nexusmods.com",
             "https://users.nexusmods.com",
@@ -462,42 +539,74 @@ class SessionManager:
         for d in nexus_domains:
             try:
                 cookies += await context.cookies(d)
-            except Exception:
-                pass
-        dedup = {f"{c.get('domain')}|{c.get('name')}": c for c in cookies}
+            except Exception as exc:
+                raise RuntimeError("读取 N 网登录信息失败，原登录信息已保留。") from exc
+        now = time.time()
+        valid = []
+        for cookie in cookies:
+            domain = str(cookie.get("domain") or "").lstrip(".").lower()
+            expires = cookie.get("expires", -1)
+            if (domain != "nexusmods.com" and not domain.endswith(".nexusmods.com")):
+                continue
+            if not cookie.get("name") or not cookie.get("value"):
+                continue
+            if type(expires) in (int, float) and expires >= 0 and expires <= now:
+                continue
+            valid.append(cookie)
+        dedup = {(c.get("domain"), c.get("path", "/"), c.get("name")): c for c in valid}
         cookies = list(dedup.values())
-        config.ensure_dirs()
+        if not any(relevant in str(cookie["name"]).lower()
+                   for cookie in cookies for relevant in ("sid_", "jwt", "access_token")):
+            raise RuntimeError("未取得有效的 N 网登录信息，原登录信息已保留。")
         raw = {"cookies": cookies, "origins": []}
-        config.SESSION_FILE.write_text(
-            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
-        )
-        config.SESSION_META_FILE.write_text(json.dumps({
+        _atomic_json(self.session_file, raw)
+        _atomic_json(config.SESSION_META_FILE, {
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "user_agent": ua,
             "cookie_count": len(cookies),
             "source": source,
-        }, ensure_ascii=False), encoding="utf-8")
+            "browser_channel": browser_channel if browser_channel in ("msedge", "chrome") else None,
+        })
         return len(cookies)
 
     # ------------------------------------------------------------- internals
     async def _verify(self, context) -> bool:
         page = None
+        self._verification_problem = "page_unready"
         try:
             page = await context.new_page()
-            await page.goto(self.verify_url, wait_until="domcontentloaded",
-                            timeout=45_000)
-            await page.wait_for_timeout(2500)
-            res = await page.evaluate(IS_LOGGED_IN_JS)
-            if res.get("ok"):
-                return True
-            # cookie-based fallback: Nexus sets sid_*/jwt_* tokens when logged in
-            cookies = await context.cookies(self.verify_url)
-            names = " ".join(c["name"].lower() for c in cookies)
-            return bool(names) and (
-                "sid_" in names or "jwt" in names or "access_token" in names
-            )
+            for attempt in range(2):
+                try:
+                    if attempt and _is_nexus_url(str(page.url or "")):
+                        await page.reload(wait_until="domcontentloaded", timeout=45_000)
+                    else:
+                        await page.goto(self.verify_url, wait_until="domcontentloaded", timeout=45_000)
+                except Exception as exc:
+                    log.warning("session navigation attempt %d failed: %s", attempt + 1, type(exc).__name__)
+                    if page.is_closed():
+                        return False
+                    # Navigation can time out after the useful document arrived.
+                    # Inspect that document before deciding whether to reload it.
+                try:
+                    for _ in range(6):
+                        if page.is_closed():
+                            return False
+                        state = await self._auth_page_state(page)
+                        if state.get("hasLoginForm"):
+                            self._verification_problem = "login_required"
+                            return False
+                        if state.get("challenge"):
+                            self._verification_problem = "challenge"
+                        if state.get("ok") and state.get("ready"):
+                            return True
+                        await page.wait_for_timeout(1500)
+                    if self._verification_problem == "challenge":
+                        return False
+                except Exception as exc:
+                    log.warning("session verify attempt %d failed: %s", attempt + 1, type(exc).__name__)
+            return False
         except Exception as exc:  # pragma: no cover - network hiccup path
-            log.warning("session verify failed: %s", exc)
+            log.warning("session verify failed: %s", type(exc).__name__)
             return False
         finally:
             if page is not None:

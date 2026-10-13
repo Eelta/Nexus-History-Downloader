@@ -54,6 +54,8 @@ class AppState:
         self.refresh_error: str | None = None
         self.progress = ProgressTracker()
         self.refresh_task: asyncio.Task | None = None
+        self.refresh_waiting_for_login: asyncio.Task | None = None
+        self.refresh_force = False
         self.login_status: dict = {"state": "idle", "message": ""}
         self.login_task: asyncio.Task | None = None
         self.filter_stats: dict = {}
@@ -131,14 +133,14 @@ def runner() -> NexusScraper:
 # ------------------------------------------------------------- background jobs
 
 
-def _replace_login_task(coro) -> None:
-    """Start a new auth flow; a still-running old one is cancelled first
-    (no more HTTP 409 '登录流程已在进行' dead-ends)."""
+def _start_login() -> bool:
+    """Reuse an active login, including its post-login refresh coordination."""
     old = state.login_task
     if old is not None and not old.done():
-        log.info("cancelling previous auth flow to replace it")
-        old.cancel()
-    state.login_task = asyncio.create_task(coro)
+        log.info("login already running - reusing it")
+        return False
+    state.login_task = asyncio.create_task(profile_job())
+    return True
 
 
 async def _start_refresh(force: bool = False) -> bool:
@@ -147,10 +149,57 @@ async def _start_refresh(force: bool = False) -> bool:
     forever. 正在扫描时直接复用（返回 False 表示复用/已在进行）。"""
     old = state.refresh_task
     if old is not None and not old.done():
+        state.refresh_force = state.refresh_force or force
         log.info("refresh already running - reusing it (no cancel)")
         return False
-    state.refresh_task = asyncio.create_task(refresh_job(force=force))
+    # Capture this dependency before scheduling: login may finish before the
+    # refresh task gets its first turn. The login itself must never wait on a
+    # refresh that is waiting for that same login.
+    caller = asyncio.current_task()
+    login = state.login_task
+    if login is caller or (login is not None and login.done()):
+        login = None
+    state.refresh_force = force
+    state.refresh_waiting_for_login = login
+    state.refresh_task = asyncio.create_task(_refresh_when_ready(login, caller))
     return True
+
+
+async def _refresh_when_ready(login: asyncio.Task | None,
+                              caller: asyncio.Task | None) -> None:
+    try:
+        # A login could also have started after the refresh was scheduled.
+        latest = state.login_task
+        if login is None and latest is not None and latest is not caller and not latest.done():
+            login = latest
+        while login is not None:
+            state.refresh_waiting_for_login = login
+            succeeded = await asyncio.shield(login)
+            latest = state.login_task
+            if latest is not None and latest is not login and latest is not caller:
+                login = latest
+                continue
+            if not succeeded:
+                state.refresh_error = state.login_status.get("message") or "登录未完成，未刷新"
+                return
+            # Always collect with the newly saved session, bypassing scan cache.
+            state.refresh_force = True
+            break
+        state.refresh_waiting_for_login = None
+        await refresh_job(force=state.refresh_force)
+    finally:
+        state.refresh_waiting_for_login = None
+
+
+async def _refresh_after_login() -> None:
+    old = state.refresh_task
+    if old is not None and not old.done():
+        if state.refresh_waiting_for_login is not None:
+            state.refresh_force = True
+            return
+        # Let an already running scan finish, then refresh with the new session.
+        await asyncio.shield(old)
+    await _start_refresh(force=True)
 
 
 async def refresh_job(force: bool = False) -> None:
@@ -182,7 +231,7 @@ async def refresh_job(force: bool = False) -> None:
         await state.progress.finish()
 
 
-async def profile_job() -> None:
+async def profile_job() -> bool:
     state.login_status = {
         "state": "waiting",
         "message": "已用浏览器资料打开窗口；若窗口空白，请手动打开 https://www.nexusmods.com/ 登录，完成后自动继续",
@@ -195,9 +244,8 @@ async def profile_job() -> None:
             "state": "done",
             "message": f"已保存你的真实浏览器会话（{count or 0} 个 Cookie），开始自动抓取…",
         }
-        # 登录成功后自动开始抓取（单任务锁，避免并发抓取互相打崩）
-        if not state.progress.snapshot()["running"]:
-            await _start_refresh()
+        await _refresh_after_login()
+        return True
     except asyncio.CancelledError:
         if state.login_task is asyncio.current_task():
             state.login_status = {"state": "idle", "message": "已取消"}
@@ -205,6 +253,7 @@ async def profile_job() -> None:
     except Exception as exc:
         log.exception("real-profile login failed")
         state.login_status = {"state": "error", "message": str(exc)}
+        return False
 
 
 # ------------------------------------------------------------------ fastapi
@@ -323,8 +372,9 @@ async def progress():
 async def auth_profile():
     """The ONLY login method: open the user's REAL Edge/Chrome profile and
     persist the nexus session from it (no password, no cookie copying)."""
-    _replace_login_task(profile_job())
-    return {"started": True, "note": "正在用你的浏览器资料打开窗口"}
+    started = _start_login()
+    return {"started": started, "reused": not started,
+            "note": "正在用你的浏览器资料打开窗口" if started else "登录正在进行"}
 
 
 @app.post("/api/auth/clear")
