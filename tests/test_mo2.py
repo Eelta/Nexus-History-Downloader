@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -58,6 +59,15 @@ class InstallTests(unittest.TestCase):
         atomic_json(Path(job["queueDir"]) / "responses" / (job["attempt"] + ".json"),
                     {"id": job["attempt"], "state": state, "mod_name": "Native Name", "message": state})
         self.manager.tick([])
+
+    def seed_old_bridge(self, queue=None):
+        plugins = self.mo / "plugins"
+        plugins.mkdir(exist_ok=True)
+        target = plugins / "nhd_mo2_bridge.py"
+        target.write_bytes(b"# previous packaged bridge\n")
+        config = plugins / "nhd_bridge.json"
+        atomic_json(config, {"queue_dir": str(queue or self.manager.queue_dir(self.mo)), "preserve": True})
+        return target, config
 
     def test_suggestions_use_id_game_content_and_custom_name(self):
         self.add_mod("SkyUI - 我的中文名称")
@@ -211,6 +221,233 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(job["state"], "installing")
         with self.assertRaises(ValueError):
             self.manager.retry(job["id"])
+
+    def test_retention_setting_defaults_validates_and_preserves_other_settings(self):
+        self.assertEqual(self.manager.settings()["historyRetentionDays"], 30)
+        for days in (0, 7, 30, 90):
+            self.assertEqual(self.manager.update_settings({"historyRetentionDays": days})["settings"]["historyRetentionDays"], days)
+        original = (self.root / "settings.json").read_bytes()
+        for days in (True, False, "7", -1, 1, 7.0, None, []):
+            with self.subTest(days=days), self.assertRaises(ValueError):
+                self.manager.update_settings({"historyRetentionDays": days})
+        self.assertEqual((self.root / "settings.json").read_bytes(), original)
+        settings = json.loads(original)
+        self.assertEqual(settings["custom"], {"nested": 42})
+        self.assertEqual(self.archive_info.read_bytes(), self.old_info)
+
+    def test_expired_history_is_pruned_without_touching_package_mods_or_bridge(self):
+        target = self.add_mod("Existing mod")
+        metadata = (target / "meta.ini").read_bytes()
+        archive = self.archive.read_bytes()
+        job = self.enqueue()
+        self.respond(job, "installed")
+        job["completedAt"] = time.time() - 31 * 86400
+        self.manager.save()
+        queue = Path(job["queueDir"])
+        queue_files = {str(path): path.read_bytes() for path in queue.rglob("*") if path.is_file()}
+        self.manager.tick([self.download])
+        self.assertEqual(self.manager.jobs, {})
+        self.assertIn(job["id"], self.manager.tombstones)
+        self.assertEqual(self.archive.read_bytes(), archive)
+        self.assertEqual((target / "meta.ini").read_bytes(), metadata)
+        self.assertEqual(self.archive_info.read_bytes(), self.old_info)
+        self.assertEqual({str(path): path.read_bytes() for path in queue.rglob("*") if path.is_file()}, queue_files)
+
+    def test_pruned_jobs_stay_deduplicated_after_poll_restart_and_history_replay(self):
+        self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        self.manager.skip(job["id"])
+        job["completedAt"] = time.time() - 31 * 86400
+        self.manager.save()
+        self.manager.tick([self.download])
+        self.assertFalse(self.manager.jobs)
+        for name in ("takeover-jobs.jsonl", "takeover-history.jsonl"):
+            (self.root / "cache" / name).write_text(json.dumps(self.download) + "\n", encoding="utf-8")
+        restored = MO2Manager(self.root, self.manager.assets)
+        for _ in range(3):
+            restored.tick([self.download])
+        self.assertFalse(restored.jobs)
+        self.assertEqual(restored.tombstones, {job["id"]})
+        # A new explicit download of the same package remains eligible.
+        restored.tick([{**self.download, "id": "new-download"}])
+        self.assertEqual(len(restored.jobs), 1)
+        self.assertNotIn(job["id"], restored.jobs)
+
+    def test_retention_keeps_active_failed_cleanup_error_and_recent_records(self):
+        variants = [
+            ("awaiting_confirmation", False, 365), ("queued", False, 365),
+            ("installing", False, 365), ("error", False, 365),
+            ("installed", True, 365), ("cancelled", True, 365),
+            ("installed", False, 1), ("cancelled", False, 1),
+        ]
+        self.manager.tick([{**self.download, "id": str(index)} for index in range(len(variants))])
+        for job, (state, cleanup_error, age) in zip(self.manager.jobs.values(), variants):
+            job.update(state=state, cleanupError="needs attention" if cleanup_error else "",
+                       completedAt=time.time() - age * 86400)
+        self.assertFalse(self.manager.prune_history(30))
+        self.assertEqual(len(self.manager.jobs), len(variants))
+        self.assertFalse(self.manager.tombstone_file.exists())
+
+    def test_zero_retention_keeps_old_history_and_shorter_setting_applies_immediately(self):
+        self.manager.update_settings({"historyRetentionDays": 0})
+        self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        self.manager.skip(job["id"])
+        job["completedAt"] = time.time() - 10 * 86400
+        self.manager.save()
+        self.manager.tick([self.download])
+        self.assertIn(job["id"], self.manager.jobs)
+        result = self.manager.update_settings({"historyRetentionDays": 7})
+        self.assertEqual(result["jobs"], [])
+        self.manager.update_settings({"historyRetentionDays": 0})
+        self.manager.tick([self.download])
+        self.assertEqual(self.manager.jobs, {})
+
+    def test_legacy_terminal_record_gets_full_retention_period_and_time_persists(self):
+        self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        job.update(state="installed")
+        self.manager.save()
+        with patch("mo2.time.time", return_value=1000000000):
+            self.manager.tick([])
+        self.assertEqual(job["completedAt"], 1000000000)
+        restored = MO2Manager(self.root, self.manager.assets)
+        with patch("mo2.time.time", return_value=1000000000 + 29 * 86400):
+            restored.tick([self.download])
+        self.assertIn(job["id"], restored.jobs)
+        with patch("mo2.time.time", return_value=1000000000 + 31 * 86400):
+            restored.tick([self.download])
+        self.assertNotIn(job["id"], restored.jobs)
+
+    def test_tombstone_write_failure_keeps_history_and_old_dedup_record(self):
+        self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        self.manager.skip(job["id"])
+        job["completedAt"] = time.time() - 31 * 86400
+        self.manager.save()
+        old = self.manager.state_file.read_bytes()
+        real_write = atomic_json
+        def fail_tombstone(path, value):
+            if path == self.manager.tombstone_file:
+                raise OSError("disk full")
+            real_write(path, value)
+        with patch("mo2.atomic_json", side_effect=fail_tombstone), self.assertRaises(OSError):
+            self.manager.tick([self.download])
+        self.assertIn(job["id"], self.manager.jobs)
+        self.assertFalse(self.manager.tombstones)
+        self.assertEqual(self.manager.state_file.read_bytes(), old)
+
+    def test_job_write_failure_after_pruning_still_keeps_durable_tombstone(self):
+        self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        self.manager.skip(job["id"])
+        job["completedAt"] = time.time() - 31 * 86400
+        self.manager.save()
+        with patch.object(self.manager, "save", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            self.manager.tick([self.download])
+        self.assertIn(job["id"], json.loads(self.manager.tombstone_file.read_text())["ids"])
+        restored = MO2Manager(self.root, self.manager.assets)
+        restored.tick([self.download])
+        self.assertFalse(restored.jobs)
+        self.assertTrue(self.archive.exists())
+
+    def test_corrupt_tombstones_pause_instead_of_recreating_old_downloads(self):
+        self.manager.directory.mkdir(parents=True)
+        self.manager.tombstone_file.write_text("{bad json", encoding="utf-8")
+        broken = MO2Manager(self.root, self.manager.assets)
+        broken.tick([self.download])
+        self.assertFalse(broken.status()["ok"])
+        self.assertFalse(broken.jobs)
+        self.assertEqual(broken.tombstone_file.read_text(), "{bad json")
+        self.assertFalse(broken.state_file.exists())
+
+    def test_native_completion_timestamp_and_retry_reset(self):
+        job = self.enqueue()
+        completed = time.time() - 60
+        atomic_json(Path(job["queueDir"]) / "responses" / (job["attempt"] + ".json"),
+                    {"id": job["attempt"], "state": "cancelled", "completed_at": completed})
+        self.manager.tick([])
+        self.assertEqual(job["completedAt"], completed)
+        self.manager.retry(job["id"])
+        self.assertNotIn("completedAt", job)
+
+    def test_existing_own_bridge_upgrades_on_tick_without_queue_or_config_changes(self):
+        target, config = self.seed_old_bridge()
+        original_config = config.read_bytes()
+        restored = MO2Manager(self.root, self.manager.assets)
+        self.assertEqual(target.read_bytes(), b"# previous packaged bridge\n")
+        self.assertFalse(restored.queue_dir(self.mo).exists())
+        restored.tick([])
+        self.assertEqual(target.read_bytes(), (restored.assets / "mo2_plugin" / target.name).read_bytes())
+        self.assertEqual(config.read_bytes(), original_config)
+        self.assertFalse(restored.queue_dir(self.mo).exists())
+        self.assertFalse(restored.state_file.exists())
+        self.assertEqual(restored.jobs, {})
+        self.assertEqual(self.archive_info.read_bytes(), self.old_info)
+
+    def test_foreign_bridge_queue_is_never_taken_over(self):
+        target, config = self.seed_old_bridge(self.root / "other-downloader" / "queue")
+        original_plugin, original_config = target.read_bytes(), config.read_bytes()
+        self.manager.tick([])
+        self.assertEqual(target.read_bytes(), original_plugin)
+        self.assertEqual(config.read_bytes(), original_config)
+        self.assertFalse(self.manager.queue_dir(self.mo).exists())
+        self.assertFalse(self.manager.state_file.exists())
+
+    def test_disabled_monitor_does_not_upgrade_bridge(self):
+        target, config = self.seed_old_bridge()
+        original_plugin, original_config = target.read_bytes(), config.read_bytes()
+        self.manager.update_settings({"enabled": False})
+        self.manager.tick([])
+        self.assertEqual(target.read_bytes(), original_plugin)
+        self.assertEqual(config.read_bytes(), original_config)
+        self.assertEqual(self.manager._bridge_checks, set())
+
+    def test_bridge_auto_upgrade_is_checked_once_per_path(self):
+        self.seed_old_bridge()
+        with patch.object(self.manager, "_write_bridge_plugin", wraps=self.manager._write_bridge_plugin) as write:
+            self.manager.tick([])
+            self.manager.tick([])
+            self.manager.tick([])
+        self.assertEqual(write.call_count, 1)
+
+    def test_missing_bridge_config_or_plugin_is_not_auto_created(self):
+        target, config = self.seed_old_bridge()
+        config.unlink()
+        self.manager.tick([])
+        self.assertEqual(target.read_bytes(), b"# previous packaged bridge\n")
+        self.assertFalse(config.exists())
+        target.unlink()
+        restored = MO2Manager(self.root, self.manager.assets)
+        restored.tick([])
+        self.assertFalse(target.exists())
+        self.assertFalse(config.exists())
+
+    def test_upgrade_failure_preserves_history_and_explicit_save_clears_error(self):
+        target, config = self.seed_old_bridge()
+        original_plugin, original_config = target.read_bytes(), config.read_bytes()
+        with patch.object(self.manager, "_write_bridge_plugin", side_effect=PermissionError("file locked")):
+            self.manager.tick([self.download])
+        status = self.manager.status()
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["bridge"]["state"], "update_failed")
+        self.assertIn("file locked", status["bridge"]["message"])
+        self.assertEqual(len(status["jobs"]), 1)
+        self.assertEqual(target.read_bytes(), original_plugin)
+        self.assertEqual(config.read_bytes(), original_config)
+        result = self.manager.update_settings({"historyRetentionDays": 7})
+        self.assertNotEqual(result["bridge"]["state"], "update_failed")
+        self.assertEqual(self.manager._bridge_update_errors, {})
+
+    def test_confirmation_success_clears_stale_bridge_upgrade_error(self):
+        self.seed_old_bridge()
+        with patch.object(self.manager, "_write_bridge_plugin", side_effect=PermissionError("file locked")):
+            self.manager.tick([self.download])
+        job = next(iter(self.manager.jobs.values()))
+        result = self.manager.confirm(job["id"], "Confirmed name")
+        self.assertNotEqual(result["bridge"]["state"], "update_failed")
+        self.assertEqual(self.manager._bridge_update_errors, {})
+        self.assertEqual(job["state"], "queued")
 
 
 if __name__ == "__main__":

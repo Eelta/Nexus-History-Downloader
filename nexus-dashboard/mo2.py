@@ -9,6 +9,7 @@ import configparser
 import difflib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -21,6 +22,8 @@ import zipfile
 
 DEFAULT_MO2_PATH = r"F:\Skyrim\iniRePather-Skyrim"
 ARCHIVE_EXTENSIONS = {".zip", ".7z", ".rar", ".fomod"}
+HISTORY_RETENTION_DAYS = {0, 7, 30, 90}
+TERMINAL_STATES = {"installed", "cancelled", "error"}
 
 
 def atomic_json(path: Path, data) -> None:
@@ -37,6 +40,10 @@ def read_json(path: Path, default=None):
     if not path.exists():
         return default
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def valid_timestamp(value) -> bool:
+    return (type(value) in (int, float) and math.isfinite(value) and value > 0)
 
 
 def read_ini(path: Path) -> configparser.ConfigParser:
@@ -203,11 +210,17 @@ class MO2Manager:
         self.assets = assets
         self.directory = root / "cache" / "mo2"
         self.state_file = self.directory / "install-jobs.json"
+        # Keep the existing jobs format intact. Compact IDs outlive visible
+        # history because the download host can replay old completed jobs.
+        self.tombstone_file = self.directory / "install-history-tombstones.json"
         self.settings_file = root / "settings.json"
         self.lock = threading.RLock()
         self.error = ""
         self.jobs = {}
+        self.tombstones = set()
         self.offsets = {}
+        self._bridge_checks = set()
+        self._bridge_update_errors = {}
         try:
             self.jobs = read_json(self.state_file, {})
             if not isinstance(self.jobs, dict):
@@ -222,6 +235,12 @@ class MO2Manager:
                         isinstance(job.get(field), str) and job[field]
                         for field in ("attempt", "queueDir", "installName")):
                     raise ValueError("安装队列记录不完整")
+            tombstones = read_json(self.tombstone_file, {"version": 1, "ids": []})
+            if (not isinstance(tombstones, dict) or tombstones.get("version") != 1
+                    or not isinstance(tombstones.get("ids"), list)
+                    or any(not isinstance(key, str) for key in tombstones["ids"])):
+                raise ValueError("安装历史去重记录格式无效")
+            self.tombstones = set(tombstones["ids"])
         except (OSError, ValueError) as exc:
             # Never replace unreadable user data with an empty state.
             self.jobs = {}
@@ -237,20 +256,60 @@ class MO2Manager:
                 raise ValueError("settings.json 的 MO2.%s 必须为 true 或 false，原文件已保留" % key)
         if "mo2Path" in saved and (not isinstance(saved["mo2Path"], str) or not saved["mo2Path"].strip()):
             raise ValueError("settings.json 的 MO2.mo2Path 必须为目录路径")
+        retention = saved.get("historyRetentionDays", 30)
+        if type(retention) is not int or retention not in HISTORY_RETENTION_DAYS:
+            raise ValueError("安装历史保留时间必须为 0、7、30 或 90 天")
         return {"enabled": saved.get("enabled", True),
                 "mo2Path": saved.get("mo2Path", DEFAULT_MO2_PATH),
-                "deleteAfterInstall": saved.get("deleteAfterInstall", False)}
+                "deleteAfterInstall": saved.get("deleteAfterInstall", False),
+                "historyRetentionDays": retention}
 
     def save(self):
         if self.error:
             raise ValueError(self.error)
         atomic_json(self.state_file, self.jobs)
 
+    def prune_history(self, retention: int) -> bool:
+        """Drop expired display records without touching packages or mods.
+
+        A durable tombstone must precede removal. If either write fails, an
+        existing record or its tombstone still prevents repeat installation.
+        Legacy terminal jobs receive a full retention period on first use.
+        """
+        if self.error:
+            return False
+        now = time.time()
+        changed = False
+        expired = set()
+        for key, job in self.jobs.items():
+            if job["state"] not in TERMINAL_STATES:
+                continue
+            if not valid_timestamp(job.get("completedAt")):
+                job["completedAt"] = now
+                changed = True
+            # Failed installations and unsuccessful package cleanup still
+            # require a player's decision and must remain available to retry.
+            if (retention and job["state"] in ("installed", "cancelled")
+                    and not job.get("cleanupError")
+                    and job["completedAt"] < now - retention * 86400):
+                expired.add(key)
+        if expired:
+            tombstones = self.tombstones | expired
+            atomic_json(self.tombstone_file, {"version": 1, "ids": sorted(tombstones)})
+            self.tombstones = tombstones
+            for key in expired:
+                del self.jobs[key]
+            changed = True
+        return changed
+
     def queue_dir(self, root: Path) -> Path:
         identity = hashlib.sha256(str(root.resolve()).casefold().encode()).hexdigest()[:20]
         return self.directory / "bridge" / identity
 
     def bridge_status(self, root: Path) -> dict:
+        update_error = self._bridge_update_errors.get(self._bridge_key(root))
+        if update_error:
+            return {"state": "update_failed", "message": update_error}
         try:
             status = read_json(self.queue_dir(root) / "bridge-status.json", {})
             if time.time() - float(status.get("updated_at", 0)) < 15:
@@ -262,24 +321,64 @@ class MO2Manager:
                 "message": "请打开或重启所选 MO2，安装会在连接后继续" if deployed.is_file()
                 else "选择 MO2 目录后自动配置连接；首次使用需重启 MO2"}
 
-    def deploy(self, root: Path):
-        if not root.is_absolute() or not (root / "ModOrganizer.exe").is_file():
-            raise ValueError("请选择包含 ModOrganizer.exe 的 MO2 目录")
+    @staticmethod
+    def _bridge_key(root: Path) -> str:
+        return os.path.normcase(str(root.resolve()))
+
+    def _write_bridge_plugin(self, root: Path):
         source = self.assets / "mo2_plugin" / "nhd_mo2_bridge.py"
         if not source.is_file():
             raise ValueError("缺少 MO2 安装连接组件，请重新构建应用")
         plugin_dir = root / "plugins"
-        plugin_dir.mkdir(exist_ok=True)
         target = plugin_dir / source.name
         contents = source.read_bytes()
         if not target.exists() or target.read_bytes() != contents:
-            temp = target.with_suffix(".py.tmp")
-            temp.write_bytes(contents)
-            os.replace(temp, target)
+            temp = target.with_name(target.name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                temp.write_bytes(contents)
+                os.replace(temp, target)
+            finally:
+                temp.unlink(missing_ok=True)
+
+    def _upgrade_configured_bridge(self, root: Path):
+        """Refresh this downloader's existing bridge once per selected path.
+
+        This runs only in the enabled background monitor, never construction.
+        A different queue is another downloader's connection and is untouched.
+        """
+        key = self._bridge_key(root)
+        if key in self._bridge_checks:
+            return
+        self._bridge_checks.add(key)
+        try:
+            if (not root.is_absolute() or not (root / "ModOrganizer.exe").is_file()
+                    or not (root / "plugins" / "nhd_mo2_bridge.py").is_file()):
+                return
+            config = read_json(root / "plugins" / "nhd_bridge.json")
+            configured = config.get("queue_dir") if isinstance(config, dict) else None
+            if (not isinstance(configured, str) or not Path(configured).is_absolute()
+                    or self._bridge_key(Path(configured)) != self._bridge_key(self.queue_dir(root))):
+                return
+            self._write_bridge_plugin(root)
+            self._bridge_update_errors.pop(key, None)
+        except (OSError, ValueError) as exc:
+            # Installation/history polling stays available if a plugin file is
+            # locked. An explicit settings save or confirmation can retry.
+            self._bridge_update_errors[key] = "MO2 桥接更新失败：" + str(exc)
+
+    def deploy(self, root: Path):
+        if not root.is_absolute() or not (root / "ModOrganizer.exe").is_file():
+            raise ValueError("请选择包含 ModOrganizer.exe 的 MO2 目录")
+        plugin_dir = root / "plugins"
+        plugin_dir.mkdir(exist_ok=True)
+        self._write_bridge_plugin(root)
         queue = self.queue_dir(root)
         for part in ("requests", "responses"):
             (queue / part).mkdir(parents=True, exist_ok=True)
         atomic_json(plugin_dir / "nhd_bridge.json", {"queue_dir": str(queue.resolve())})
+        key = self._bridge_key(root)
+        self._bridge_checks.add(key)
+        self._bridge_update_errors.pop(key, None)
 
     def update_settings(self, body: dict):
         with self.lock:
@@ -287,6 +386,8 @@ class MO2Manager:
             new = {**current, **{k: body[k] for k in current if k in body}}
             if type(new["enabled"]) is not bool or type(new["deleteAfterInstall"]) is not bool:
                 raise ValueError("安装和清理开关必须为布尔值")
+            if type(new["historyRetentionDays"]) is not int or new["historyRetentionDays"] not in HISTORY_RETENTION_DAYS:
+                raise ValueError("安装历史保留时间必须为 0、7、30 或 90 天")
             new["mo2Path"] = str(new["mo2Path"]).strip().strip('"')
             root = Path(new["mo2Path"])
             if not root.is_absolute():
@@ -298,10 +399,13 @@ class MO2Manager:
             data = read_json(self.settings_file, {})
             data["MO2"] = new
             atomic_json(self.settings_file, data)
+            changed = self.prune_history(new["historyRetentionDays"])
             if new["mo2Path"] != current["mo2Path"]:
                 for job in self.jobs.values():
                     if job["state"] == "awaiting_confirmation":
                         job.update(suggest_install(job, self.selected_mods_path(root)))
+                changed = True
+            if changed:
                 self.save()
             return self.status()
 
@@ -350,14 +454,16 @@ class MO2Manager:
                 return
             changed = self.collect_results()
             settings = self.settings()
+            changed = self.prune_history(settings["historyRetentionDays"]) or changed
             if settings["enabled"]:
                 root = Path(settings["mo2Path"])
+                self._upgrade_configured_bridge(root)
                 for download in downloads + self.completed_history():
                     if download.get("state") != "done" or not download.get("savePath"):
                         continue
                     identity = "|".join(str(download.get(k) or "") for k in ("id", "startedAt", "savePath"))
                     key = hashlib.sha256(identity.encode()).hexdigest()[:32]
-                    if key in self.jobs:
+                    if key in self.jobs or key in self.tombstones:
                         continue
                     path = Path(download["savePath"])
                     if not path.is_file() or path.suffix.lower() not in ARCHIVE_EXTENSIONS:
@@ -405,6 +511,7 @@ class MO2Manager:
                 raise ValueError("只能重试已取消或失败的安装")
             fingerprint(Path(job["archivePath"]))
             job.update({"state": "awaiting_confirmation", "message": "请重新确认名称后安装"})
+            job.pop("completedAt", None)
             self.save()
             return self.status()
 
@@ -413,7 +520,8 @@ class MO2Manager:
             job = self.jobs[key]
             if job["state"] != "awaiting_confirmation":
                 raise ValueError("安装已提交，请在 MO2 安装窗口中取消")
-            job.update({"state": "cancelled", "message": "已跳过安装，安装包已保留"})
+            job.update({"state": "cancelled", "message": "已跳过安装，安装包已保留",
+                        "completedAt": time.time()})
             self.save()
             return self.status()
 
@@ -430,8 +538,10 @@ class MO2Manager:
             except (OSError, ValueError):
                 continue
             if response.get("id") == attempt and response.get("state") in ("installed", "cancelled", "error"):
+                completed_at = response.get("completed_at")
                 job.update({"state": response["state"], "message": response.get("message", ""),
-                            "installedName": response.get("mod_name", "")})
+                            "installedName": response.get("mod_name", ""),
+                            "completedAt": completed_at if valid_timestamp(completed_at) else time.time()})
                 if response["state"] == "installed" and job.get("deleteAfterInstall") is True:
                     try:
                         path = Path(job["archivePath"])
@@ -455,6 +565,7 @@ class MO2Manager:
                         job.update({"state": "installing", "message": "请在 MO2 中选择安装选项"})
                         changed = True
                 else:
-                    job.update({"state": "error", "message": "安装队列写入中断，请重试；安装包已保留"})
+                    job.update({"state": "error", "message": "安装队列写入中断，请重试；安装包已保留",
+                                "completedAt": time.time()})
                     changed = True
         return changed

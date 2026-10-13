@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
   <title>NHD · 模组管理</title>
-  <link rel="stylesheet" href="static/style.css?v=32" />
+  <link rel="stylesheet" href="static/style.css?v=34" />
 </head>
 <body>
   <div id="wallpaperBackdrop" class="wallpaper-backdrop hidden" aria-hidden="true">
@@ -128,6 +128,15 @@
             <label><input id="mo2Enabled" type="checkbox" checked> 下载后安装到 MO2</label>
             <label><input id="mo2DeleteArchive" type="checkbox"> 安装成功后删除安装包</label>
           </div>
+          <div class="setting-select-field">
+            <label class="field-label" for="mo2HistoryRetention">历史保留</label>
+            <select id="mo2HistoryRetention" class="settings-select">
+              <option value="7">7 天</option>
+              <option value="30" selected>30 天</option>
+              <option value="90">90 天</option>
+              <option value="0">永久</option>
+            </select>
+          </div>
         </form>
       </section>
       <section class="settings-section" aria-labelledby="wallpaperSettingsHeading">
@@ -151,6 +160,6 @@
   </dialog>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
-  <script src="static/app.js?v=32"></script>
+  <script src="static/app.js?v=34"></script>
 </body>
 </html>

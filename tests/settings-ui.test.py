@@ -79,6 +79,7 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), partial(StaticOnly, directory=str
 threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{server.server_port}"
 persisted_appearance = {"fontSize": 13}
+persisted_mo2 = {}
 
 try:
     with sync_playwright() as playwright:
@@ -103,6 +104,7 @@ try:
             marker = "boot().catch"
             assert source.count(marker) == 1
             initial = "Object.assign(previewSettings['/api/appearance/settings'], " + json.dumps(persisted_appearance) + ");\n"
+            initial += "Object.assign(mo2Preview.settings, " + json.dumps(persisted_mo2) + ");\n"
             route.fulfill(body=source.replace(marker, initial + marker), content_type="application/javascript")
         page.route(BASE + "/static/app.js*", preview_script)
         page.goto(BASE + "/?preview=1")
@@ -129,6 +131,57 @@ try:
         assert page.locator('#btnDlDir, #btnMo2Save, #btnWallpaperSave').count() == 0
         assert page.locator('#settingsDialog button').evaluate_all("els => els.every(el => !/^保存/.test(el.textContent))")
         passed('Settings have no save buttons; controls stay in the native modal')
+
+        # Retention is a per-field setting; zero means keep history and must survive loading.
+        retention = page.locator('#mo2HistoryRetention')
+        assert retention.input_value() == '30'
+        assert set(retention.locator('option').evaluate_all('els => els.map(el => el.value)')) == {'0', '7', '30', '90'}
+        page.evaluate("""() => {
+          mo2Preview.settings.historyRetentionDays = 0;
+          mo2State.settingsLoaded = false;
+          return refreshMo2Status();
+        }""")
+        assert retention.input_value() == '0'
+        passed('MO2 history retention defaults to 30 days and loads the zero-day keep-history setting correctly')
+
+        other_mo2_settings = page.evaluate("""() => {
+          const {historyRetentionDays, ...other} = mo2Preview.settings; return other;
+        }""")
+        for days in [7, 30, 90, 0]:
+            count_before = page.evaluate("__qaRequests.filter(r => r.method === 'POST' && r.path === '/api/mo2/settings').length")
+            retention.select_option(str(days))
+            page.wait_for_function('days => mo2Preview.settings.historyRetentionDays === days', arg=days, timeout=450)
+            idle(page)
+            requests = page.evaluate("__qaRequests.filter(r => r.method === 'POST' && r.path === '/api/mo2/settings')")
+            assert len(requests) == count_before + 1
+            assert requests[-1]['body'] == {'historyRetentionDays': days}
+            assert type(requests[-1]['body']['historyRetentionDays']) is int
+            assert page.evaluate("""() => {
+              const {historyRetentionDays, ...other} = mo2Preview.settings; return other;
+            }""") == other_mo2_settings
+            assert not retention.is_disabled()
+        passed('All retention choices autosave one numeric field immediately without overwriting other MO2 settings')
+
+        page.evaluate("""() => {
+          window.__qaStaleMo2Settings = JSON.parse(JSON.stringify(mo2Preview));
+          __qaHook = request => request.method === 'GET' && request.path === '/api/mo2/status'
+            ? new Promise(resolve => {window.__qaReleaseMo2Status = resolve;}) : undefined;
+          mo2State.settingsLoaded = false;
+          window.__qaLateMo2Status = refreshMo2Status();
+        }""")
+        retention.select_option('7')
+        page.wait_for_function('mo2Preview.settings.historyRetentionDays === 7 && !settingsSave.running')
+        page.evaluate("""async () => {
+          __qaReleaseMo2Status(__qaStaleMo2Settings); await __qaLateMo2Status;
+          showMo2Status(__qaStaleMo2Settings, true);
+          __qaHook = null;
+        }""")
+        assert retention.input_value() == '7'
+        assert page.evaluate('mo2Preview.settings.historyRetentionDays') == 7
+        retention.select_option('0')
+        page.wait_for_function('mo2Preview.settings.historyRetentionDays === 0')
+        idle(page)
+        passed('Late MO2 status and forced settings refresh cannot overwrite an edited retention selection')
 
         # A GET begun before an edit must not replace that edit when it arrives late.
         page.evaluate("""() => {
@@ -345,6 +398,20 @@ try:
         passed('Bridge-only polling preserves the exact confirmation input node, draft, focus and selection')
 
         page.evaluate("""() => {
+          mo2Preview.bridge = {state:'update_failed', message:'安装连接更新失败：测试文件被占用'};
+          return refreshMo2Status();
+        }""")
+        assert page.locator('#mo2Chip').inner_text() == '更新失败'
+        assert page.locator('#mo2Connection').is_visible()
+        assert page.locator('#mo2Connection').inner_text() == '安装连接更新失败：测试文件被占用'
+        assert '重启' not in page.locator('#mo2Connection').inner_text()
+        page.evaluate("mo2Preview.bridge = {state:'ready', message:''}; refreshMo2Status()")
+        assert page.locator('#mo2Chip').inner_text() == '已连接'
+        assert page.locator('#mo2Connection').text_content() == ''
+        assert not page.locator('#mo2Connection').is_visible()
+        passed('Bridge update failure shows its actual error instead of restart advice and clears after ready recovery')
+
+        page.evaluate("""() => {
           mo2Preview.jobs[0].state = 'installing';
           mo2Preview.bridge.state = 'ready';
           return refreshMo2Status();
@@ -390,6 +457,86 @@ try:
         assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 1'
         passed('Archive cleanup failure remains visibly installed and exposes the cleanup error in history')
 
+        # A fresh job should select its highest candidate, but still wait for Install.
+        page.evaluate("""() => {
+          const base = {state:'awaiting_confirmation', installName:'', suggestedName:'旧建议名称',
+            matchReason:'原始匹配说明', candidates:[
+              {name:'最高匹配名称', reason:'最高候选匹配依据'},
+              {name:'第二匹配名称', reason:'第二候选匹配依据'}]};
+          mo2Preview.jobs.push({...base, id:'qa-candidate-top', filename:'Candidate-top-fixture.zip'});
+          return refreshMo2Status();
+        }""")
+        top = page.locator('.mo2-job').filter(has_text='Candidate-top-fixture.zip')
+        assert top.locator('.mo2-name-input').input_value() == '最高匹配名称'
+        assert top.locator('.mo2-candidates').input_value() == '最高匹配名称'
+        assert top.locator('.mo2-job-reason').text_content() == '最高候选匹配依据'
+        page.evaluate('refreshMo2Status()')
+        assert page.evaluate("mo2Preview.jobs.find(j => j.id === 'qa-candidate-top').state") == 'awaiting_confirmation'
+        assert page.evaluate("__qaRequests.every(r => r.path !== '/api/mo2/jobs/qa-candidate-top/confirm')")
+        # Deliberately never open or interact with the candidate dropdown.
+        top.locator('.mo2-confirm-form button[type="submit"]').click()
+        page.wait_for_function("mo2Preview.jobs.find(j => j.id === 'qa-candidate-top').state === 'queued'")
+        assert page.evaluate("__qaRequests.filter(r => r.path === '/api/mo2/jobs/qa-candidate-top/confirm').map(r => r.body)") == [{'installName':'最高匹配名称'}]
+        passed('The top candidate is preselected and submits only after Install, without opening the dropdown')
+
+        page.evaluate("""() => {
+          mo2Preview.jobs.push({id:'qa-candidate-sync', filename:'Candidate-sync-fixture.zip',
+            state:'awaiting_confirmation', installName:'', suggestedName:'旧建议名称', matchReason:'原始说明',
+            candidates:[{name:'最高匹配名称',reason:'最高候选匹配依据'}, {name:'第二匹配名称',reason:'第二候选匹配依据'}]});
+          return refreshMo2Status();
+        }""")
+        candidate_row = page.locator('.mo2-job').filter(has_text='Candidate-sync-fixture.zip')
+        candidate_input = candidate_row.locator('.mo2-name-input')
+        candidate_select = candidate_row.locator('.mo2-candidates')
+        candidate_select.select_option('第二匹配名称')
+        page.evaluate('refreshMo2Status()')
+        page.evaluate("""() => {
+          const job = mo2Preview.jobs.find(j => j.id === 'qa-candidate-sync');
+          job.matchReason = '更新后的匹配说明';
+          job.candidates[0] = {name:'更新后的最高匹配名称', reason:'更新后的最高候选依据'};
+          return refreshMo2Status();
+        }""")
+        assert candidate_input.input_value() == '第二匹配名称'
+        assert candidate_select.input_value() == '第二匹配名称'
+        assert candidate_row.locator('.mo2-job-reason').text_content() == '第二候选匹配依据'
+        assert page.evaluate("mo2State.drafts.get('qa-candidate-sync')") == '第二匹配名称'
+        passed('Choosing a secondary candidate synchronizes its name/reason and survives unchanged and rebuilt polling')
+
+        candidate_input.fill('玩家手写自定义名称')
+        candidate_input.evaluate('el => el.setSelectionRange(1, 4)')
+        page.evaluate("""() => {
+          mo2Preview.jobs.find(j => j.id === 'qa-candidate-sync').suggestedName = '后来生成的新建议';
+          return refreshMo2Status();
+        }""")
+        assert candidate_input.input_value() == '玩家手写自定义名称'
+        assert candidate_select.input_value() == ''
+        assert candidate_select.locator('option:checked').text_content() == '自定义'
+        assert candidate_select.locator('option:checked').evaluate('el => el.disabled')
+        assert candidate_input.evaluate('el => document.activeElement === el && el.selectionStart === 1 && el.selectionEnd === 4')
+        assert page.evaluate("mo2State.drafts.get('qa-candidate-sync')") == '玩家手写自定义名称'
+        assert page.evaluate("__qaRequests.every(r => r.path !== '/api/mo2/jobs/qa-candidate-sync/confirm')")
+        passed('Custom names show the custom option and preserve draft, focus and selection during polling without submitting')
+
+        candidate_input.fill('第二匹配名称')
+        assert candidate_select.input_value() == '第二匹配名称'
+        assert candidate_row.locator('.mo2-job-reason').text_content() == '第二候选匹配依据'
+        page.evaluate('refreshMo2Status()')
+        assert candidate_select.input_value() == '第二匹配名称'
+        assert page.evaluate("mo2State.drafts.get('qa-candidate-sync')") == '第二匹配名称'
+        passed('Typing an existing candidate name restores its selected option and matching reason')
+
+        page.evaluate("""() => {
+          mo2Preview.jobs.push({id:'qa-candidate-existing', filename:'Candidate-existing-fixture.zip',
+            state:'awaiting_confirmation', installName:'已有指定安装名称', suggestedName:'新建议名称',
+            candidates:[{name:'新最高候选',reason:'新匹配'}]});
+          return refreshMo2Status();
+        }""")
+        existing = page.locator('.mo2-job').filter(has_text='Candidate-existing-fixture.zip')
+        assert existing.locator('.mo2-name-input').input_value() == '已有指定安装名称'
+        assert existing.locator('.mo2-candidates').input_value() == ''
+        passed('An existing explicit installation name takes priority over new candidate suggestions')
+        page.evaluate("mo2Preview.jobs = mo2Preview.jobs.filter(j => !j.id.startsWith('qa-candidate-')); refreshMo2Status()")
+
         # Font scaling must reach list, form and button typography, including narrow layout.
         before_sizes = page.evaluate("['.mod-title a','#dlDirInput','#btnSettings'].map(s => parseFloat(getComputedStyle(document.querySelector(s)).fontSize))")
         page.locator('#btnSettings').click()
@@ -417,12 +564,16 @@ try:
         passed('Font size updates list, inputs and buttons immediately; 22 px fits 1366 and 390 px layouts')
 
         persisted_appearance.update(page.evaluate("previewSettings['/api/appearance/settings']"))
+        persisted_mo2['historyRetentionDays'] = page.evaluate('mo2Preview.settings.historyRetentionDays')
         expected_reloaded_size = page.locator('.mod-title a').first.evaluate('el => parseFloat(getComputedStyle(el).fontSize)')
         page.reload()
         page.wait_for_function("document.querySelector('#fontSizeRange').value === '22' && document.querySelectorAll('.mod-card').length === 5")
         assert page.locator('#fontSizeValue').inner_text() == '22'
         assert page.locator('.mod-title a').first.evaluate('el => parseFloat(getComputedStyle(el).fontSize)') == expected_reloaded_size
         passed('Reload restores the font size from simulated persisted appearance settings')
+        page.wait_for_function("document.querySelector('#mo2HistoryRetention').value === '0'")
+        assert page.evaluate('mo2Preview.settings.historyRetentionDays') == 0
+        passed('Reload restores the saved keep-history choice without replacing zero with the default')
         assert not REPORT['errors'], REPORT['errors']
         assert not REPORT['blocked_requests'], REPORT['blocked_requests']
         passed('No JavaScript errors, external requests or live backend mutations')

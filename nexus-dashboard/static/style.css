@@ -191,6 +191,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .mo2-options { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; margin-top: 20px; }
 .mo2-options label { display: inline-flex; align-items: center; gap: 9px; color: #c2c2c2; font-size: calc(12px * var(--font-scale)); }
 .mo2-options input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: #dddddd; }
+.setting-select-field { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 17px; margin-top: 20px; }
+.setting-select-field .field-label { margin: 0; }
+.settings-select { width: 8em; max-width: 100%; min-width: 0; padding: 8px 10px; border: 1px solid #3e3e3e; border-radius: 7px; background: #111111; color: #dddddd; font-size: calc(12px * var(--font-scale)); cursor: pointer; transition: border-color .16s; }
+.settings-select:hover { border-color: #606060; }
 .wallpaper-toggle { display: inline-flex; align-items: center; gap: 9px; margin: 0 0 18px; color: #c2c2c2; font-size: calc(12px * var(--font-scale)); }
 .wallpaper-toggle input { flex: none; width: 15px; height: 15px; margin: 0; accent-color: #dddddd; }
 .wallpaper-status { margin: 12px 0 0; color: #aaaaaa; font-size: calc(11px * var(--font-scale)); overflow-wrap: anywhere; }

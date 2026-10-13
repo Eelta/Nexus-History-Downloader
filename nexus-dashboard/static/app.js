@@ -993,7 +993,7 @@ const mo2State = {
 
 const mo2Preview = {
   ok: true,
-  settings: { enabled: true, mo2Path: "F:\\Skyrim\\iniRePather-Skyrim", deleteAfterInstall: false },
+  settings: { enabled: true, mo2Path: "F:\\Skyrim\\iniRePather-Skyrim", deleteAfterInstall: false, historyRetentionDays: 30 },
   bridge: { state: "ready", message: "静态预览：实际安装时，请在 MO2 窗口中完成选项。" },
   jobs: [{
     id: "preview-mo2", filename: "SkyUI_5.2_SE.7z", archivePath: "D:\\Downloads\\SkyUI_5.2_SE.7z",
@@ -1032,13 +1032,13 @@ function mo2BridgeConnected() {
 
 function showMo2Bridge(bridge) {
   mo2State.bridge = { state: "unavailable", message: "", ...bridge };
-  const labels = { ready: "已连接", installing: "安装中", unavailable: "未连接", needs_restart: "未连接", not_configured: "待设置" };
+  const labels = { ready: "已连接", installing: "安装中", unavailable: "未连接", needs_restart: "未连接", not_configured: "待设置", update_failed: "更新失败" };
   const connected = mo2BridgeConnected();
   $("mo2Chip").textContent = labels[mo2State.bridge.state] || "未连接";
   $("mo2Chip").title = mo2State.bridge.message || "";
   $("mo2Chip").className = "chip " + (connected ? "chip-ok" : "chip-warn");
   const connection = $("mo2Connection");
-  connection.textContent = connected ? "" : mo2State.bridge.state === "not_configured" ? "在设置中选择 MO2" : "打开或重启 MO2";
+  connection.textContent = connected ? "" : mo2State.bridge.state === "update_failed" ? mo2State.bridge.message : mo2State.bridge.state === "not_configured" ? "在设置中选择 MO2" : "打开或重启 MO2";
   connection.title = mo2State.bridge.message || "";
   connection.classList.toggle("hidden", connected);
   connection.classList.toggle("is-ready", connected);
@@ -1050,6 +1050,10 @@ function showMo2Status(result, applySettings = false) {
     if (!settingEdited("mo2Path")) $("mo2Path").value = result.settings.mo2Path || "F:\\Skyrim\\iniRePather-Skyrim";
     if (!settingEdited("mo2Enabled")) $("mo2Enabled").checked = result.settings.enabled !== false;
     if (!settingEdited("mo2DeleteArchive")) $("mo2DeleteArchive").checked = result.settings.deleteAfterInstall === true;
+    if (!settingEdited("mo2HistoryRetention")) {
+      const days = result.settings.historyRetentionDays;
+      $("mo2HistoryRetention").value = String([0, 7, 30, 90].includes(days) ? days : 30);
+    }
     mo2State.settingsLoaded = true;
   }
   if (result.bridge) showMo2Bridge(result.bridge);
@@ -1147,7 +1151,8 @@ function buildMo2Job(job) {
   const error = mo2Element("div", "mo2-job-error hidden");
   error.setAttribute("role", "alert");
   if (waiting) {
-    if (!mo2State.drafts.has(id)) mo2State.drafts.set(id, job.installName || job.suggestedName || "");
+    const candidates = Array.isArray(job.candidates) ? job.candidates : [];
+    if (!mo2State.drafts.has(id)) mo2State.drafts.set(id, job.installName || candidates[0]?.name || job.suggestedName || "");
     const form = mo2Element("form", "mo2-confirm-form");
     const label = mo2Element("label", "mo2-name-label");
     label.appendChild(mo2Element("span", "", "安装名称"));
@@ -1158,16 +1163,28 @@ function buildMo2Job(job) {
     input.spellcheck = false;
     input.value = mo2State.drafts.get(id);
     input.placeholder = "模组名称";
-    input.addEventListener("input", () => { mo2State.drafts.set(id, input.value); input.setCustomValidity(""); });
+    let candidateSelect = null;
+    const syncCandidate = () => {
+      const candidate = candidates.find((item) => item.name === input.value);
+      if (candidateSelect) candidateSelect.value = candidate ? candidate.name : "";
+      const reason = row.querySelector(".mo2-job-reason");
+      if (reason) reason.textContent = candidate?.reason || job.matchReason || "";
+    };
+    input.addEventListener("input", () => {
+      mo2State.drafts.set(id, input.value);
+      input.setCustomValidity("");
+      syncCandidate();
+    });
     label.appendChild(input);
     form.appendChild(label);
-    const candidates = Array.isArray(job.candidates) ? job.candidates : [];
     if (candidates.length) {
       const candidatesLabel = mo2Element("label", "mo2-candidates-label");
       candidatesLabel.appendChild(mo2Element("span", "", "候选"));
       const select = mo2Element("select", "mo2-candidates");
-      const placeholder = mo2Element("option", "", "已安装模组");
+      candidateSelect = select;
+      const placeholder = mo2Element("option", "", "自定义");
       placeholder.value = "";
+      placeholder.disabled = true;
       select.appendChild(placeholder);
       for (const candidate of candidates) {
         const option = mo2Element("option", "", candidate.name);
@@ -1180,9 +1197,9 @@ function buildMo2Job(job) {
         input.value = select.value;
         input.setCustomValidity("");
         mo2State.drafts.set(id, select.value);
-        const reason = row.querySelector(".mo2-job-reason");
-        if (reason) reason.textContent = candidates.find((candidate) => candidate.name === select.value)?.reason || job.matchReason || "";
+        syncCandidate();
       });
+      syncCandidate();
       candidatesLabel.appendChild(select);
       form.appendChild(candidatesLabel);
     }
@@ -1415,6 +1432,7 @@ const settingFields = {
   mo2Path: ['mo2', '/api/mo2/settings', 'mo2Path'],
   mo2Enabled: ['mo2', '/api/mo2/settings', 'enabled'],
   mo2DeleteArchive: ['mo2', '/api/mo2/settings', 'deleteAfterInstall'],
+  mo2HistoryRetention: ['mo2', '/api/mo2/settings', 'historyRetentionDays'],
   wallpaperDir: ['wallpaper', '/api/wallpaper/settings', 'directory'],
   wallpaperEnabled: ['wallpaper', '/api/wallpaper/settings', 'enabled'],
   wallpaperOpacity: ['wallpaper', '/api/wallpaper/settings', 'opacity'],
@@ -1458,7 +1476,7 @@ function scheduleSettingsSave() {
 function queueSetting(id, delay = 0) {
   const control = $(id);
   const [group, endpoint, field] = settingFields[id];
-  const value = control.type === 'checkbox' ? control.checked : control.type === 'range'
+  const value = control.type === 'checkbox' ? control.checked : control.type === 'range' || id === 'mo2HistoryRetention'
     ? (id === 'wallpaperOpacity' ? (100 - Number(control.value)) / 100 : Number(control.value)) : control.value.trim();
   if (settingsSave.desired.get(id) === value && !settingsSave.errors.has(id)) {
     if (!delay && settingsSave.pending.has(id)) settingsSave.pending.get(id).due = Date.now();
@@ -1623,7 +1641,7 @@ function wireEvents() {
       if (id === 'wallpaperOpacity') previewWallpaperOpacity();
       if (id === 'fontSizeRange') previewFontSize();
       if (id === 'wallpaperEnabled') $('wallpaperBackdrop').classList.toggle('hidden', !control.checked);
-      if (!event.isComposing) queueSetting(id, control.type === 'checkbox' ? 0 : control.type === 'range' ? 150 : 550);
+      if (!event.isComposing) queueSetting(id, control.type === 'checkbox' || control.tagName === 'SELECT' ? 0 : control.type === 'range' ? 150 : 550);
     });
     control.addEventListener('change', () => queueSetting(id));
     control.addEventListener('compositionend', () => queueSetting(id, 550));
@@ -1631,7 +1649,7 @@ function wireEvents() {
       if (settingsSave.pending.has(id)) { settingsSave.pending.get(id).due = Date.now(); scheduleSettingsSave(); }
     });
     control.addEventListener('keydown', event => {
-      if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); queueSetting(id); }
+      if (event.key === 'Enter' && !event.isComposing && control.tagName !== 'SELECT') { event.preventDefault(); queueSetting(id); }
     });
   }
   for (const id of ['mo2Settings', 'wallpaperSettings']) {
