@@ -319,6 +319,77 @@ try:
         assert page.evaluate('[...state.discarded]') == [1001]
         passed('Wallpaper rotation, MO2 editable confirmation and archive records remain functional')
 
+        # Connection changes must update queued status without disturbing another name draft.
+        page.evaluate("""() => {
+          mo2Preview.jobs.push({...mo2Preview.jobs[0], id:'qa-awaiting', state:'awaiting_confirmation',
+            filename:'Awaiting-name-fixture.zip', installName:'', suggestedName:'推荐安装名称'});
+          window.__qaQueuedJob = JSON.stringify(mo2Preview.jobs[0]);
+          return refreshMo2Status();
+        }""")
+        draft = page.locator('.mo2-name-input')
+        draft.fill('桥接切换时保留的安装名称')
+        draft.evaluate("el => {el.setSelectionRange(2, 6); window.__qaDraftInput = el;}")
+        for bridge, expected in [('needs_restart', '等待 MO2 连接'), ('ready', '等待 MO2 接收'), ('unavailable', '等待 MO2 连接')]:
+            page.evaluate("""bridge => {
+              mo2Preview.bridge = {state:bridge, message:'isolated bridge fixture'};
+              return refreshMo2Status();
+            }""", bridge)
+            assert page.evaluate('JSON.stringify(mo2Preview.jobs[0]) === __qaQueuedJob')
+            assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-heading .chip').textContent") == '未安装'
+            assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-status').textContent") == expected
+            assert page.evaluate("document.querySelector('.mo2-name-input') === __qaDraftInput")
+            assert page.evaluate('document.activeElement === __qaDraftInput')
+            assert draft.input_value() == '桥接切换时保留的安装名称'
+            assert draft.evaluate('el => [el.selectionStart, el.selectionEnd]') == [2, 6]
+        passed('An unchanged queued job stays uninstalled and follows restart, ready and disconnected bridge status')
+        passed('Bridge-only polling preserves the exact confirmation input node, draft, focus and selection')
+
+        page.evaluate("""() => {
+          mo2Preview.jobs[0].state = 'installing';
+          mo2Preview.bridge.state = 'ready';
+          return refreshMo2Status();
+        }""")
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-status').textContent") == '在 MO2 中完成选项'
+        page.evaluate("mo2Preview.bridge.state = 'unavailable'; refreshMo2Status()")
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-heading .chip').textContent") == '安装中'
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-status').textContent") == '等待 MO2 返回结果'
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.parentElement.id") == 'mo2Jobs'
+        passed('An installing job remains in progress after disconnect and waits for the MO2 result')
+
+        page.evaluate("mo2Preview.jobs[0].state = 'queued'; mo2Preview.bridge.state = 'ready'; refreshMo2Status()")
+        assert not page.locator('#mo2History').evaluate('el => el.open')
+        page.evaluate("""() => {
+          mo2Preview.jobs[0].state = 'installed';
+          mo2Preview.jobs[0].installedName = '玩家自定模组名称';
+          return refreshMo2Status();
+        }""")
+        assert page.locator('#mo2History').evaluate('el => el.open')
+        assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 0'
+        assert page.locator('#mo2HistoryJobs .mo2-job').count() == 1
+        page.locator('#mo2HistorySummary').click()
+        assert not page.locator('#mo2History').evaluate('el => el.open')
+        page.evaluate('refreshMo2Status()')
+        page.evaluate('refreshMo2Status()')
+        assert not page.locator('#mo2History').evaluate('el => el.open')
+        passed('Queued-to-installed transition expands history once; manual collapse survives repeated polling')
+
+        page.evaluate("""() => {
+          mo2Preview.jobs.push({id:'qa-cancelled', state:'cancelled', filename:'Cancelled-fixture.zip'});
+          return refreshMo2Status();
+        }""")
+        assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 1'
+        assert page.evaluate("mo2State.rows.get('qa-cancelled').row.querySelector('.mo2-job-heading .chip').textContent") == '已跳过'
+        assert not page.locator('#mo2History').evaluate('el => el.open')
+        passed('Cancelled jobs count as skipped separately from installed mods')
+
+        page.evaluate("mo2Preview.jobs[0].cleanupError = 'fixture archive locked'; refreshMo2Status()")
+        assert page.locator('#mo2History').evaluate('el => el.open')
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-heading .chip').textContent") == '已安装'
+        assert page.evaluate("mo2State.rows.get('preview-mo2').row.parentElement.id") == 'mo2HistoryJobs'
+        assert page.get_by_text('清理失败：fixture archive locked', exact=True).is_visible()
+        assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 1'
+        passed('Archive cleanup failure remains visibly installed and exposes the cleanup error in history')
+
         # Font scaling must reach list, form and button typography, including narrow layout.
         before_sizes = page.evaluate("['.mod-title a','#dlDirInput','#btnSettings'].map(s => parseFloat(getComputedStyle(document.querySelector(s)).fontSize))")
         page.locator('#btnSettings').click()

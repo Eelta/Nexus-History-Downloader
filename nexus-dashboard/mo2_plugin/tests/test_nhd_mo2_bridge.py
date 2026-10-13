@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import types
@@ -12,6 +13,11 @@ from unittest.mock import patch
 class FakeApplication:
     modal = None
     gui_thread = object()
+    application_dir = ""
+
+    @classmethod
+    def applicationDirPath(cls):
+        return cls.application_dir
 
     @classmethod
     def instance(cls):
@@ -57,26 +63,33 @@ class FakeTimer:
         pass
 
 
-def load_bridge():
+def load_bridge(embedded=False, qt_major=5):
     mobase = types.ModuleType("mobase")
     mobase.IPluginTool = type("IPluginTool", (), {})
     mobase.VersionInfo = lambda *args: args
     mobase.PluginSetting = lambda *args: args
-    core = types.ModuleType("PyQt5.QtCore")
+    qt_name = "PyQt{}".format(qt_major)
+    core = types.ModuleType(qt_name + ".QtCore")
     core.QLockFile = FakeLock
     core.QTimer = FakeTimer
     core.QThread = types.SimpleNamespace(currentThread=lambda: FakeApplication.gui_thread)
-    gui = types.ModuleType("PyQt5.QtGui")
+    gui = types.ModuleType(qt_name + ".QtGui")
     gui.QIcon = lambda: None
-    widgets = types.ModuleType("PyQt5.QtWidgets")
+    widgets = types.ModuleType(qt_name + ".QtWidgets")
     widgets.QApplication = FakeApplication
     widgets.QMessageBox = types.SimpleNamespace(information=lambda *args: None)
     with patch.dict("sys.modules", {
-        "mobase": mobase, "PyQt6": None,
-        "PyQt5": types.ModuleType("PyQt5"),
-        "PyQt5.QtCore": core, "PyQt5.QtGui": gui, "PyQt5.QtWidgets": widgets,
+        "mobase": mobase, "PyQt5": None, "PyQt6": None,
+        qt_name: types.ModuleType(qt_name),
+        qt_name + ".QtCore": core, qt_name + ".QtGui": gui, qt_name + ".QtWidgets": widgets,
     }):
         source = Path(__file__).resolve().parents[1] / "nhd_mo2_bridge.py"
+        if embedded:
+            # MO2 2.4.x's Python runner executes a script rather than importing
+            # a normal module, so the script globals do not contain __file__.
+            module = types.ModuleType("nhd_bridge_embedded")
+            exec(compile(source.read_text(encoding="utf-8"), str(source), "exec"), module.__dict__)
+            return module
         spec = importlib.util.spec_from_file_location("nhd_bridge_under_test", source)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -127,9 +140,11 @@ class BridgeTests(unittest.TestCase):
         (self.queue / "responses").mkdir()
         self.archive = self.root / "A mod.7z"
         self.archive.write_bytes(b"downloaded archive kept intact")
-        self.config = self.root / "nhd_bridge.json"
+        self.application_dir = self.root / "MO2 application"
+        self.config = self.application_dir / "plugins" / "nhd_bridge.json"
         BRIDGE._atomic_json(self.config, {"queue_dir": str(self.queue)})
         FakeApplication.modal = None
+        FakeApplication.application_dir = str(self.application_dir)
         FakeLock.held = {}
         self.organizer = FakeOrganizer(self.root)
         self.window = types.SimpleNamespace(isEnabled=lambda: True)
@@ -141,7 +156,6 @@ class BridgeTests(unittest.TestCase):
 
     def make_plugin(self, ready=True):
         plugin = BRIDGE.createPlugin()
-        plugin._config_path = self.config
         plugin.init(self.organizer)
         if ready:
             self.organizer.ui_callback(self.window)
@@ -159,6 +173,38 @@ class BridgeTests(unittest.TestCase):
 
     def response(self, request_id="one"):
         return BRIDGE._read_json(self.queue / "responses" / (request_id + ".json"))
+
+    def test_embedded_load_without_file_uses_executable_plugins_for_qt5_and_qt6(self):
+        unrelated_cwd = self.root / "unrelated working directory"
+        unrelated_cwd.mkdir()
+        decoy_queue = self.root / "wrong-queue"
+        # Both plausible but wrong roots have valid decoy configurations. The
+        # bridge must never read either one when MO2 uses a separate instance.
+        for directory in (unrelated_cwd, self.organizer.root):
+            BRIDGE._atomic_json(directory / "plugins" / "nhd_bridge.json", {
+                "queue_dir": str(decoy_queue),
+            })
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(unrelated_cwd)
+            for qt_major in (5, 6):
+                with self.subTest(qt_major=qt_major):
+                    module = load_bridge(embedded=True, qt_major=qt_major)
+                    self.assertNotIn("__file__", module.__dict__)
+                    plugin = module.createPlugin()
+                    self.assertEqual(plugin._config_path, self.config)
+                    self.assertTrue(plugin.init(self.organizer))
+                    self.organizer.ui_callback(self.window)
+                    request_id = "qt{}".format(qt_major)
+                    self.enqueue(request_id)
+                    plugin._tick()
+                    self.assertEqual(self.response(request_id)["state"], "installed")
+                    self.assertEqual(plugin._queue, self.queue)
+                    self.assertEqual(module._read_json(self.queue / "bridge-status.json")["state"], "ready")
+                    plugin._queue_lock.unlock()
+                    self.assertFalse(decoy_queue.exists())
+        finally:
+            os.chdir(original_cwd)
 
     def test_confirmed_unicode_name_native_success_and_no_archive_cleanup(self):
         self.enqueue()

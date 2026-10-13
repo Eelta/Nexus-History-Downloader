@@ -81,7 +81,10 @@ class NHDMO2Bridge(mobase.IPluginTool):
         self._current_id = None
         self._pending_response = None
         self._last_error = None
-        self._config_path = Path(__file__).resolve().with_name("nhd_bridge.json")
+        # MO2 2.4.x executes plugin source without defining __file__. The
+        # downloader deploys the bridge beside the executable, not inside the
+        # active profile/base path; Qt provides that directory on both Qt 5/6.
+        self._config_path = Path(QApplication.applicationDirPath()) / "plugins" / "nhd_bridge.json"
 
     def init(self, organizer):
         self._organizer = organizer
@@ -98,7 +101,7 @@ class NHDMO2Bridge(mobase.IPluginTool):
         return "Install confirmed Nexus History Downloader archives using MO2's own installers."
 
     def version(self):
-        return mobase.VersionInfo(1, 0, 0)
+        return mobase.VersionInfo(1, 0, 1)
 
     def isActive(self):
         return self._organizer is not None and bool(

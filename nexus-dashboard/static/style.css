@@ -124,6 +124,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .mo2-job-heading .chip { font-size: calc(10px * var(--font-scale)); padding: 2px 6px; }
 .mo2-job-path { margin: 6px 0; color: #888888; font-size: calc(10px * var(--font-scale)); overflow-wrap: anywhere; }
 .mo2-job-reason, .mo2-job-message { margin: 8px 0; color: #999999; font-size: calc(11px * var(--font-scale)); line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
+.mo2-job-status { color: #c4c4c4; }
 .mo2-job-details { margin-top: 8px; color: #999999; font-size: calc(11px * var(--font-scale)); }
 .mo2-job-details summary { display: list-item; cursor: pointer; width: fit-content; }
 .mo2-job-details summary:hover { color: #dddddd; }

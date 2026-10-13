@@ -987,6 +987,8 @@ const mo2State = {
   rows: new Map(),
   busy: new Set(),
   jobs: [],
+  jobsLoaded: false,
+  bridge: { state: "unavailable", message: "" },
 };
 
 const mo2Preview = {
@@ -1024,6 +1026,24 @@ function mo2Element(tag, className, value) {
   return element;
 }
 
+function mo2BridgeConnected() {
+  return mo2State.bridge.state === "ready" || mo2State.bridge.state === "installing";
+}
+
+function showMo2Bridge(bridge) {
+  mo2State.bridge = { state: "unavailable", message: "", ...bridge };
+  const labels = { ready: "已连接", installing: "安装中", unavailable: "未连接", needs_restart: "未连接", not_configured: "待设置" };
+  const connected = mo2BridgeConnected();
+  $("mo2Chip").textContent = labels[mo2State.bridge.state] || "未连接";
+  $("mo2Chip").title = mo2State.bridge.message || "";
+  $("mo2Chip").className = "chip " + (connected ? "chip-ok" : "chip-warn");
+  const connection = $("mo2Connection");
+  connection.textContent = connected ? "" : mo2State.bridge.state === "not_configured" ? "在设置中选择 MO2" : "打开或重启 MO2";
+  connection.title = mo2State.bridge.message || "";
+  connection.classList.toggle("hidden", connected);
+  connection.classList.toggle("is-ready", connected);
+}
+
 function showMo2Status(result, applySettings = false) {
   if (result.ok === false) throw new Error(result.message || "读取安装状态失败");
   if (result.settings && (applySettings || !mo2State.settingsLoaded)) {
@@ -1032,18 +1052,9 @@ function showMo2Status(result, applySettings = false) {
     if (!settingEdited("mo2DeleteArchive")) $("mo2DeleteArchive").checked = result.settings.deleteAfterInstall === true;
     mo2State.settingsLoaded = true;
   }
-  const bridge = result.bridge || {};
-  const labels = { ready: "已连接", installing: "安装中", unavailable: "未连接", needs_restart: "需重启", not_configured: "待设置" };
-  $("mo2Chip").textContent = labels[bridge.state] || "未连接";
-  $("mo2Chip").title = bridge.message || "";
-  $("mo2Chip").className = "chip " + (bridge.state === "ready" ? "chip-ok" : "chip-warn");
-  $("mo2Connection").textContent = "";
-  $("mo2Connection").classList.add("hidden");
-  $("mo2Connection").classList.toggle("is-ready", bridge.state === "ready");
-  if (Array.isArray(result.jobs)) {
-    mo2State.jobs = result.jobs;
-    renderMo2Jobs();
-  }
+  if (result.bridge) showMo2Bridge(result.bridge);
+  if (Array.isArray(result.jobs)) mo2State.jobs = result.jobs;
+  renderMo2Jobs();
 }
 
 async function refreshMo2Status() {
@@ -1052,11 +1063,10 @@ async function refreshMo2Status() {
   try {
     showMo2Status(await api("/api/mo2/status"));
   } catch (error) {
+    showMo2Bridge({ state: "unavailable", message: error.message });
     $("mo2Chip").textContent = "连接中断";
-    $("mo2Chip").className = "chip chip-warn";
-    $("mo2Connection").classList.remove("is-ready");
-    $("mo2Connection").textContent = error.message;
-    $("mo2Connection").classList.remove("hidden");
+    $("mo2Connection").textContent = "等待连接恢复";
+    renderMo2Jobs();
   } finally {
     mo2State.polling = false;
   }
@@ -1077,16 +1087,23 @@ function renderMo2Jobs() {
   let active = 0;
   let history = 0;
   let awaiting = 0;
+  let installed = 0;
+  let skipped = 0;
+  let revealHistory = false;
   for (const job of jobs) {
     const id = String(job.id);
-    const completed = (job.state === "installed" && !job.cleanupError) || job.state === "cancelled";
+    const completed = job.state === "installed" || job.state === "cancelled";
     const parent = completed ? $("mo2HistoryJobs") : $("mo2Jobs");
     if (completed) history++; else active++;
     if (job.state === "awaiting_confirmation") awaiting++;
+    if (job.state === "installed") installed++;
+    if (job.state === "cancelled") skipped++;
     // 不在轮询中重建未改变的卡片，避免打断输入、候选下拉框和键盘焦点。
-    const signature = JSON.stringify(job);
+    const connectionState = job.state === "queued" || job.state === "installing" ? mo2State.bridge.state : "";
+    const signature = JSON.stringify([job, connectionState]);
     const record = mo2State.rows.get(id);
     if (record && (record.signature === signature || mo2State.busy.has(id))) continue;
+    if (job.state === "installed" && ((record ? record.state !== "installed" : mo2State.jobsLoaded) || (job.cleanupError && !record?.cleanupError))) revealHistory = true;
     const oldInput = record && record.row.querySelector(".mo2-name-input");
     const selection = oldInput && document.activeElement === oldInput
       ? [oldInput.selectionStart, oldInput.selectionEnd, oldInput.selectionDirection] : null;
@@ -1095,7 +1112,7 @@ function renderMo2Jobs() {
     if (detailsOpen && row.querySelector(".mo2-job-details")) row.querySelector(".mo2-job-details").open = true;
     if (record && record.row.parentElement === parent) record.row.replaceWith(row);
     else { if (record) record.row.remove(); parent.appendChild(row); }
-    mo2State.rows.set(id, { row, signature });
+    mo2State.rows.set(id, { row, signature, state: job.state, cleanupError: job.cleanupError });
     const newInput = selection && row.querySelector(".mo2-name-input");
     if (newInput) {
       newInput.focus({ preventScroll: true });
@@ -1104,15 +1121,17 @@ function renderMo2Jobs() {
   }
   $("mo2Empty").classList.toggle("hidden", active > 0);
   $("mo2History").classList.toggle("hidden", !history);
-  $("mo2HistorySummary").textContent = `历史 · ${history}`;
+  $("mo2HistorySummary").textContent = `已安装 ${installed} · 已跳过 ${skipped}`;
+  if (revealHistory) $("mo2History").open = true;
   $("mo2JobCount").textContent = awaiting ? `${awaiting} 待确认` : (active ? String(active) : "");
+  mo2State.jobsLoaded = true;
 }
 
 function buildMo2Job(job) {
   const id = String(job.id);
   const waiting = job.state === "awaiting_confirmation";
   const displayName = job.state === "installed" ? (job.installedName || job.installName) : job.installName;
-  const labels = { awaiting_confirmation: "待确认", queued: "排队", installing: "安装中", installed: "已安装", cancelled: "已跳过", error: "失败" };
+  const labels = { awaiting_confirmation: "待确认", queued: "未安装", installing: "安装中", installed: "已安装", cancelled: "已跳过", error: "失败" };
   const row = mo2Element("article", "mo2-job" + (waiting ? " is-waiting" : "") + (job.state === "error" ? " is-error" : ""));
   const heading = mo2Element("div", "mo2-job-heading");
   heading.append(mo2Element("div", "mo2-job-title", job.filename || job.installName || "模组安装包"),
@@ -1192,7 +1211,14 @@ function buildMo2Job(job) {
     row.appendChild(mo2Element("p", "mo2-job-message", displayName));
   }
   if (job.state === "error" && job.message) row.appendChild(mo2Element("p", "mo2-job-error", job.message));
-  if (job.state === "installing") row.appendChild(mo2Element("p", "mo2-job-message", "等待 MO2 操作"));
+  if (job.state === "queued" || job.state === "installing") {
+    const message = job.state === "queued"
+      ? (mo2BridgeConnected() ? "等待 MO2 接收" : "等待 MO2 连接")
+      : (mo2BridgeConnected() ? "在 MO2 中完成选项" : "等待 MO2 返回结果");
+    const status = mo2Element("p", "mo2-job-message mo2-job-status", message);
+    status.setAttribute("role", "status");
+    row.appendChild(status);
+  }
   if (job.archiveDeleted) row.appendChild(mo2Element("p", "mo2-job-message", "安装包已删除"));
   if (job.cleanupError) row.appendChild(mo2Element("p", "mo2-job-error", `清理失败：${job.cleanupError}`));
   if ((job.state === "error" || job.state === "cancelled") && !job.archiveDeleted) {
