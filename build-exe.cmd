@@ -43,6 +43,7 @@ if exist "%BACKEND_OUT%" rmdir /s /q "%BACKEND_OUT%"
   --name nexus-backend ^
   --icon "%~dp0assets\icon.ico" ^
   --add-data "%~dp0nexus-dashboard\static;static" ^
+  --add-data "%~dp0nexus-dashboard\mo2_plugin\nhd_mo2_bridge.py;mo2_plugin" ^
   --collect-all playwright ^
   --add-binary "%HOST_OUT%\Downloader.Host.exe;." ^
   --distpath "%BACKEND_OUT%" --workpath "%BUILD%\pyinstaller" --specpath "%BUILD%" ^

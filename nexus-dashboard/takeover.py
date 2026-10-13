@@ -17,6 +17,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import urllib.request
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -25,6 +27,7 @@ import config
 log = logging.getLogger("nexus.takeover")
 
 HOST_PORT_ENV = "CUSTOMDL_HOST_PORT"
+_CACHE_WRITE_LOCK = threading.Lock()
 
 
 def host_base() -> str:
@@ -71,6 +74,7 @@ def host_status() -> dict:
 def submit_download(url: str, filename: str | None, cookie: str | None,
                     referrer: str | None, save_dir: str | None = None) -> dict:
     """把下载交给 C# 宿主；返回其回执 {ok, jobId, message}。"""
+    info = _combined_info(url, referrer)
     payload = json.dumps({
         "type": "download",
         "url": url,
@@ -78,6 +82,10 @@ def submit_download(url: str, filename: str | None, cookie: str | None,
         "cookie": cookie,
         "referrer": referrer,
         "saveDir": save_dir,
+        "game": info[0] if info else None,
+        "modId": info[1] if info else None,
+        "fileId": info[2] if info else None,
+        "modName": _cached_mod_name(info),
     }).encode("utf-8")
     req = urllib.request.Request(
         host_base() + "/api/takeover", data=payload,
@@ -111,25 +119,77 @@ def _clean_filename(name: str | None) -> str | None:
 _MOD_PATH_RE = re.compile(r"/([a-z0-9_-]+)/mods/(\d+)(?:/files/(\d+))?", re.I)
 
 
-def _url_mod_info(url: str) -> tuple[str, int, str] | None:
+def _url_mod_info(url: str) -> tuple[str, int, str | None] | None:
     """从下载地址解析 (game_domain, mod_id, file_id)。"""
     try:
         m = _MOD_PATH_RE.search(url)
         if not m:
             return None
-        domain = m.group(1)
+        domain = m.group(1).lower()
         mod_id = int(m.group(2))
         fid = m.group(3)
         if not fid:
             for k, v in parse_qsl(urlparse(url).query):
-                if k == "fid":
+                if k.lower() in ("fid", "file_id"):
                     fid = v
                     break
-        if not fid:
-            return None
         return domain, mod_id, fid
     except Exception:
         return None
+
+
+def _cached_mod_name(info) -> str | None:
+    """读取保存过的模组名称；版本升级不会使已有归档名称丢失，也不会写缓存。"""
+    if not info:
+        return None
+    domain, mod_id, _ = info
+    try:
+        path = config.MODS_CACHE_DIR / f"{domain}-{mod_id}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        name = data.get("name") or data.get("mod_name")
+        return name.strip() if isinstance(name, str) and name.strip() else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _merge_download_file_cache(domain: str, mod_id: int, files: dict) -> None:
+    """补充文件名缓存，保留现有归档字段及在线列表中已消失的历史文件。"""
+    with _CACHE_WRITE_LOCK:
+        config.ensure_dirs()
+        path = config.MODS_CACHE_DIR / f"{domain}-{mod_id}.json"
+        # 读取失败时原样保留原文件，让调用者继续完成下载而不重建归档。
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("existing mod cache is not an object")
+        merged = dict(data.get("files") or {})
+        for section, incoming in files.items():
+            rows = list(merged.get(section) or [])
+            for fresh in incoming:
+                fid = str(fresh.get("file_id") or "")
+                found = next((i for i, old in enumerate(rows)
+                              if isinstance(old, dict) and (
+                                  fid and str(old.get("file_id") or "") == fid or
+                                  not fid and old.get("name") == fresh.get("name")
+                                  and old.get("version") == fresh.get("version"))), None)
+                if found is None:
+                    rows.append(fresh)
+                else:
+                    rows[found] = {**rows[found], **fresh}
+            merged[section] = rows
+        data.setdefault("app_version", config.APP_VERSION)
+        data.setdefault("mod_id", mod_id)
+        data.setdefault("game_domain", domain)
+        data["files"] = merged
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                             suffix=".tmp", delete=False) as output:
+                temp_path = output.name
+                json.dump(data, output, ensure_ascii=False, default=str)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 def _scraped_filename(info) -> str | None:
@@ -138,7 +198,7 @@ def _scraped_filename(info) -> str | None:
     Nexus 新版下载地址可能是签名 URL（路径尾段为 UUID 令牌），此时 URL 与
     浏览器建议名都不可信；文件表里的 `name` 才是真实文件名。
     """
-    if not info:
+    if not info or not info[2]:
         return None
     domain, mod_id, fid = info
     try:
@@ -147,7 +207,7 @@ def _scraped_filename(info) -> str | None:
             return None
         data = json.loads(p.read_text(encoding="utf-8"))
         # 无时间缓存：只要代码版本一致就复用；未命中 fid 时由在线解析兜底
-        if data.get("app_version") != config.APP_VERSION:
+        if data.get("app_version") not in config.CACHE_COMPATIBLE_VERSIONS:
             return None
         files = data.get("files") or {}
         for items in files.values():
@@ -162,22 +222,22 @@ def _scraped_filename(info) -> str | None:
 def _combined_info(download_url: str, page_url: str | None):
     """解析 (domain, mod_id, file_id)：先看下载地址，格式变化时用当前模组页补全。"""
     info = _url_mod_info(download_url)
-    if info:
+    if info and info[2]:
         return info
-    domain: str | None = None
-    mod_id: int | None = None
-    if page_url:
-        m = re.search(r"/([a-z0-9_-]+)/mods/(\d+)", page_url, re.I)
-        if m:
-            domain, mod_id = m.group(1), int(m.group(2))
+    page_info = _url_mod_info(page_url) if page_url else None
+    identity = info or page_info
+    if not identity:
+        return None
+    domain, mod_id, page_fid = identity
     fid: str | None = None
     for k, v in parse_qsl(urlparse(download_url).query):
-        if k == "fid":
+        if k.lower() in ("fid", "file_id"):
             fid = v
             break
-    if domain and mod_id is not None and fid:
-        return domain, mod_id, fid
-    return None
+    # URL 带模组 ID 时，不把其他模组页的 file_id 误嫁接过来。
+    if not page_fid and page_info and page_info[:2] == identity[:2]:
+        page_fid = page_info[2]
+    return domain, mod_id, fid or page_fid
 
 
 class TakeoverWindow:
@@ -316,8 +376,19 @@ class TakeoverWindow:
             # 不再按域名白名单过滤（CDN 域名会变，白名单永远追不上）。
             log.info("捕获窗口内下载：%s", url[:160])
 
+            referrer = self._last_page_url
+            page = getattr(download, "page", None)
+            if page is not None:
+                try:
+                    referrer = page.url or referrer
+                except Exception:
+                    pass
+            url_info = _combined_info(url, referrer)
+            if not url_info and self._last_page_url:
+                url_info = _combined_info(url, self._last_page_url)
+                if url_info:
+                    referrer = self._last_page_url
             suggested = _clean_filename(getattr(download, "suggested_filename", None))
-            url_info = _combined_info(url, self._last_page_url)
             scraped = _scraped_filename(url_info)
             if scraped:
                 filename = scraped   # 文件表真名优先（签名 URL 的 UUID 名不可信）
@@ -330,14 +401,6 @@ class TakeoverWindow:
             save_dir = self._next_dir
             if save_dir:
                 self._next_dir = None   # 一次性：本目录只用于下一个捕获的下载
-            referrer = self._last_page_url
-            page = getattr(download, "page", None)
-            if page is not None:
-                try:
-                    referrer = page.url or referrer
-                except Exception:
-                    pass
-
             cookies: list[dict] = []
             try:
                 cookies = await self.context.cookies(url)
@@ -370,7 +433,7 @@ class TakeoverWindow:
 
         在文件表缓存未就绪（首次使用/缓存被清）时保证文件名准确。
         """
-        if not info:
+        if not info or not info[2]:
             return None
         domain, mod_id, fid = info
         page = None
@@ -409,19 +472,11 @@ class TakeoverWindow:
                             name = _clean_filename(str(f.get("name") or "").strip())
                             if name:
                                 log.info("文件名在线解析成功：%s", name)
-                                # 命中即写缓存（无时间过期，版本校验复用），下次直接复用
+                                # 只合并文件表；已有名称、归档标记与旧文件记录必须保留。
                                 try:
-                                    config.ensure_dirs()
-                                    p = config.MODS_CACHE_DIR / f"{domain}-{mod_id}.json"
-                                    p.write_text(json.dumps({
-                                        "app_version": config.APP_VERSION,
-                                        "mod_id": mod_id,
-                                        "game_domain": domain,
-                                        "files": files,
-                                    }, ensure_ascii=False, default=str),
-                                        encoding="utf-8")
-                                except Exception:
-                                    pass
+                                    _merge_download_file_cache(domain, mod_id, files)
+                                except Exception as exc:
+                                    log.warning("保留现有模组缓存，文件名缓存未更新：%s", exc)
                                 return name
         except Exception as exc:
             log.warning("在线解析文件名异常：%s", exc)

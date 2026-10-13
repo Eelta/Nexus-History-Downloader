@@ -128,16 +128,33 @@ async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${body.slice(0, 160)}`);
+    let message = body.slice(0, 160);
+    try { const data = JSON.parse(body); message = data.detail || data.message || message; } catch { /* 非 JSON 响应。 */ }
+    const error = new Error(message || ('HTTP ' + res.status));
+    error.status = res.status;
+    throw error;
   }
   return res.json();
 }
 
+const previewSettings = {
+  '/api/download/dir': { ok: true, dir: 'D:\\Downloads' },
+  '/api/takeover/threads': { ok: true, maxThreads: 256 },
+  '/api/appearance/settings': { ok: true, fontSize: 13 },
+};
+
 /* 静态预览模式的“假后端”：只实现前端用到的几个端点。 */
-async function inlineApi(path) {
+async function inlineApi(path, opts) {
   const demo = [...inlineDemoData()].sort(
     (a, b) => ((b.updated_at || b.created_at || "") < (a.updated_at || a.created_at || "") ? -1 : 1)
   );
+  if (['/api/download/dir', '/api/takeover/threads', '/api/appearance/settings'].includes(path)) {
+    const values = previewSettings[path];
+    if (opts?.body) Object.assign(values, JSON.parse(opts.body));
+    return { ...values };
+  }
+  if (path.startsWith("/api/mo2/")) return previewMo2Api(path, opts);
+  if (path.startsWith("/api/wallpaper/")) return previewWallpaperApi(path, opts);
   if (path === "/api/status") {
     return {
       auth: false, demo: true, mods_count: demo.length,
@@ -209,18 +226,20 @@ async function refreshStatus(showNotice = true) {
 
   const auth = $("authChip");
   if (st.auth) {
-    auth.textContent = `会话: 已登录`;
+    auth.textContent = "已登录";
     auth.className = "chip chip-ok";
   } else {
-    auth.textContent = "会话: 未登录";
+    auth.textContent = "未登录";
     auth.className = "chip chip-warn";
   }
-  $("countChip").textContent = `模组: ${st.mods_count}`;
+  $("btnProfile").textContent = st.auth ? "重新登录" : "登录";
+  $("countChip").textContent = st.mods_count || 0;
   const fs = st.filter_stats;
   $("filterChip").textContent = fs && fs.game
-    ? `筛选: ${fs.game === "skyrimspecialedition" ? "Skyrim SE" : fs.game} · 保留(更新≥最近下载) ${fs.kept || 0} · 去除 ${fs.removed_old_downloads || 0}`
-    : "筛选: -";
-  $("refreshChip").textContent = st.demo ? "数据: 演示数据" : `更新: ${st.last_refresh || "-"}`;
+    ? (fs.game === "skyrimspecialedition" ? "Skyrim SE" : fs.game)
+    : "Skyrim SE";
+  $("refreshChip").textContent = st.demo ? "预览" : (st.last_refresh ? String(st.last_refresh).slice(5, 16) : "尚未刷新");
+  $("refreshChip").title = st.last_refresh || "";
   $("demoBadge").classList.toggle("hidden", !st.demo);
 
   state.jobRunning = st.job && st.job.running;
@@ -241,17 +260,17 @@ async function refreshStatus(showNotice = true) {
     }
     let msg =
       stage === "collecting_history"
-        ? `正在抓取下载历史页面…${total > 0 ? ` ${done}/${total}（${Math.round((done / total) * 100)}%）` : ""}${started_at ? ` · 已 ${elapsedSec("job:" + started_at, started_at)} 秒` : ""}`
-        : `正在处理 ${done}/${total}${st.job.current ? " · " + st.job.current : ""}`;
+        ? `扫描中${total > 0 ? ` · ${done}/${total}` : ""}${started_at ? ` · ${elapsedSec("job:" + started_at, started_at)}s` : ""}`
+        : `处理中 · ${done}/${total}`;
     // 预计剩余时间（按已完成的速度外推）
     if (stage !== "collecting_history" && total > 0 && done > 0 && started_at) {
       const elapsed = Date.now() / 1000 - started_at;
       const perItem = elapsed / done;
       const etaSec = perItem * (total - done);
       if (etaSec > 30) {
-        msg += ` · 预计剩余约 ${Math.ceil(etaSec / 60)} 分钟`;
+        msg += ` · 剩余 ${Math.ceil(etaSec / 60)}m`;
       } else if (etaSec > 0) {
-        msg += ` · 预计剩余约 ${Math.ceil(etaSec)} 秒`;
+        msg += ` · 剩余 ${Math.ceil(etaSec)}s`;
       }
     }
     if (st.job.errors && st.job.errors.length) {
@@ -288,7 +307,7 @@ function ensurePolling() {
       state.lastRefreshVersion = rv;
       // 后端刷新版本号变化 = 一次新扫描完成（比 running 翻转可靠）
       await loadMods(true);
-      setNotice("扫描完成，列表已更新");
+      setNotice("已刷新");
       return;
     }
     state.lastRefreshVersion = rv;
@@ -386,7 +405,13 @@ async function loadDiscarded() {
   renderList();   // 丢弃分组/序号在启动加载后立即生效
 }
 
-async function toggleDiscard(modId) {
+const pendingArchives = new Set();
+async function toggleDiscard(modId, button) {
+  if (pendingArchives.has(modId)) return;
+  pendingArchives.add(modId);
+  const card = button?.closest(".mod-card");
+  if (button) button.disabled = true;
+  card?.classList.add("is-pending");
   try {
     const d = await api("/api/discarded/toggle", {
       method: "POST",
@@ -395,17 +420,24 @@ async function toggleDiscard(modId) {
     });
     state.discarded = new Set((d.ids || []).map(Number));
   } catch (e) {
-    setNotice(`丢弃标记失败: ${e.message}`);
+    setNotice(`归档失败: ${e.message}`);
     return;
+  } finally {
+    pendingArchives.delete(modId);
+    if (button) button.disabled = false;
+    card?.classList.remove("is-pending");
   }
+  const restoreKeyboardFocus = document.activeElement === button;
   renderList();
+  if (restoreKeyboardFocus) $("btnDiscardToggle").focus({ preventScroll: true });
 }
 
 function updateDiscardBtn() {
   const b = $("btnDiscardToggle");
   if (!b) return;
-  b.textContent = `历史丢弃 (${state.discarded.size})`;
+  b.textContent = `归档 · ${state.discarded.size}`;
   b.classList.toggle("btn-active", state.showDiscarded);
+  b.setAttribute("aria-pressed", String(state.showDiscarded));
 }
 
 /* 导入真实浏览器会话后的状态轮询 */
@@ -439,7 +471,19 @@ function pollLoginImport() {
 }
 
 let noticeTimer = null;
+let settingsNoticeTimer = null;
 function setNotice(text) {
+  const settingsNotice = $("settingsNotice");
+  if ($("settingsDialog")?.open && settingsNotice) {
+    settingsNotice.textContent = text;
+    settingsNotice.classList.remove("hidden");
+    if (settingsNoticeTimer) clearTimeout(settingsNoticeTimer);
+    settingsNoticeTimer = setTimeout(() => {
+      settingsNotice.classList.add("hidden");
+      settingsNotice.textContent = "";
+    }, 8000);
+    return;
+  }
   const n = $("notice");
   $("noticeText").textContent = text;
   n.classList.remove("hidden");
@@ -465,8 +509,7 @@ async function loadMods() {
   state.items = data.items || [];
   state.total = data.total || state.items.length;
   renderList();
-  $("countChip").textContent = `模组: ${state.total}`;
-  $("empty").classList.toggle("hidden", state.total > 0);
+  $("countChip").textContent = state.total;
 }
 
 /* 序号排序键：严格按更新时间（desc）；无更新时间时用创建时间兜底 */
@@ -484,7 +527,9 @@ function renderList() {
   list.innerHTML = "";
 
   // 整个列表严格按更新时间排序（从历史丢弃恢复后也自动落回正确位置）
-  const order = [...state.items].sort(byUpdatedDesc);
+  const query = state.query.trim().toLocaleLowerCase();
+  const order = [...state.items].sort(byUpdatedDesc).filter((mod) =>
+    !query || `${mod.name || ""} ${mod.mod_id || ""}`.toLocaleLowerCase().includes(query));
   const droppedIds = new Set(
     order.filter((m) => state.discarded.has(m.mod_id))
         .map((m) => Number(m.mod_id))
@@ -510,7 +555,7 @@ function renderList() {
   if (state.showDiscarded && dropped.length) {
     const h = document.createElement("div");
     h.className = "group-head";
-    h.textContent = `历史丢弃 (${dropped.length})`;
+    h.textContent = `已归档 · ${dropped.length}`;
     list.appendChild(h);
     for (const m of dropped) {
       const c = buildCard(m, null);   // 被丢弃的模组不显示序号
@@ -520,6 +565,9 @@ function renderList() {
     }
   }
   updateDiscardBtn();
+  $("empty").classList.toggle("hidden", !!list.querySelector(".mod-card"));
+  $("empty").querySelector("p").textContent = query ? "无匹配" : "暂无模组";
+  $("btnClearSearch")?.classList.toggle("hidden", !state.query);
 }
 
 function buildCard(m, n) {
@@ -546,6 +594,7 @@ function buildCard(m, n) {
   link.target = "_blank";
   link.rel = "noopener";
   link.textContent = m.name || `${m.game_domain}/${m.mod_id}`;
+  link.title = link.textContent;
   // 点击模组名：立即标记“已下载”（实时，不等N网历史），并在接管窗口打开文件页
   link.addEventListener("click", (e) => {
     if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -562,11 +611,13 @@ function buildCard(m, n) {
   dates.className = "mod-dates";
   const up = document.createElement("span");
   up.className = "updated-badge";
-  up.textContent = "更新 " + fmtCompact(m.updated_at || m.created_at);
+  up.textContent = "更新 " + fmtCompact(m.updated_at || m.created_at).split(" ")[0];
+  up.title = "更新 " + fmtCompact(m.updated_at || m.created_at);
   dates.appendChild(up);
   const dl = document.createElement("span");
   dl.className = "chip dl-chip";
-  dl.textContent = "下载 " + fmtCompact(m.downloaded_at);
+  dl.textContent = "下载 " + fmtCompact(m.downloaded_at).split(" ")[0];
+  dl.title = "下载 " + fmtCompact(m.downloaded_at);
   dates.appendChild(dl);
   if (isDlMarked(m.mod_id)) {
     const done = document.createElement("button");
@@ -584,12 +635,12 @@ function buildCard(m, n) {
   const db = document.createElement("button");
   db.type = "button";
   db.className = "discard-btn";
-  db.textContent = state.discarded.has(m.mod_id) ? "恢复" : "丢弃";
-  db.title = "标记为丢弃（不再显示，可在「历史丢弃」中找回），不影响缓存数据";
+  db.textContent = state.discarded.has(m.mod_id) ? "恢复" : "归档";
+  db.title = state.discarded.has(m.mod_id) ? "恢复模组" : "归档模组";
   db.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    toggleDiscard(m.mod_id);
+    toggleDiscard(m.mod_id, db);
   });
   dates.appendChild(db);
   head.appendChild(dates);
@@ -899,10 +950,9 @@ async function cancelJob(jobId, name) {
 
 /* ------------------------------------------------ 下载目录（默认 + 本次） */
 async function loadDir() {
-  if (PREVIEW_MODE) return;
   try {
     const r = await api("/api/download/dir");
-    $("dlDirInput").value = r.dir || "";
+    if (!settingEdited("dlDirInput")) $("dlDirInput").value = r.dir || "";
   } catch (e) { /* 后端未就绪时忽略 */ }
 }
 
@@ -927,47 +977,592 @@ async function browseDir(inputId) {
   }
 }
 
-/* 并发线程滑块：实时调整宿主并发（对新下载任务生效） */
-async function loadThreads() {
-  if (PREVIEW_MODE) return;
-  try {
-    const r = await api("/api/takeover/threads");
-    if (r.ok && r.maxThreads) {
-      $("threadRange").value = r.maxThreads;
-      $("threadValue").textContent = r.maxThreads;
+/* --------------------------------------------------------- MO2 安装确认 */
+const mo2State = {
+  timer: null,
+  polling: false,
+  settingsLoaded: false,
+  settingsDirty: false,
+  drafts: new Map(),
+  rows: new Map(),
+  busy: new Set(),
+  jobs: [],
+};
+
+const mo2Preview = {
+  ok: true,
+  settings: { enabled: true, mo2Path: "F:\\Skyrim\\iniRePather-Skyrim", deleteAfterInstall: false },
+  bridge: { state: "ready", message: "静态预览：实际安装时，请在 MO2 窗口中完成选项。" },
+  jobs: [{
+    id: "preview-mo2", filename: "SkyUI_5.2_SE.7z", archivePath: "D:\\Downloads\\SkyUI_5.2_SE.7z",
+    state: "awaiting_confirmation", suggestedName: "SkyUI - 中文界面", installName: "",
+    matchReason: "Nexus 模组编号与已安装模组一致；已安装文件中包含 SkyUI_SE.esp。",
+    candidates: [{ name: "SkyUI - 中文界面", reason: "相同 Nexus 模组编号，且包含相同插件文件" },
+      { name: "SkyUI", reason: "模组名称相近" }],
+  }],
+};
+
+function previewMo2Api(path, opts) {
+  const data = opts && opts.body ? JSON.parse(opts.body) : {};
+  if (path === "/api/mo2/settings") Object.assign(mo2Preview.settings, data);
+  const action = path.match(/^\/api\/mo2\/jobs\/([^/]+)\/(confirm|retry|skip)$/);
+  if (action) {
+    const job = mo2Preview.jobs.find((item) => item.id === decodeURIComponent(action[1]));
+    if (job) {
+      job.state = { confirm: "queued", retry: "awaiting_confirmation", skip: "cancelled" }[action[2]];
+      if (action[2] === "confirm") job.installName = data.installName;
+      job.message = "静态预览，不会安装或删除实际文件。";
     }
-  } catch (e) { /* 宿主未就绪时保持默认 64 */ }
+  }
+  return JSON.parse(JSON.stringify(mo2Preview));
 }
 
-function saveThreads() {
-  const v = Number($("threadRange").value);
-  $("threadValue").textContent = v;
-  api("/api/takeover/threads", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ maxThreads: v }),
-  })
-    .then((r) => { if (!r.ok) setNotice(r.message || "设置线程数失败"); })
-    .catch((e) => setNotice(`设置线程数失败: ${e.message}`));
+function mo2Element(tag, className, value) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (value != null) element.textContent = value;
+  return element;
 }
 
-function saveDir() {
-  const d = $("dlDirInput").value.trim();
-  if (!d) { setNotice("下载目录不能为空"); return; }
-  api("/api/download/dir", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ dir: d }),
-  })
-    .then((r) => {
-      $("dlDirInput").value = r.dir || d;
-      setNotice(`默认下载目录已保存：${r.dir || d}`);
-    })
-    .catch((e) => setNotice(`保存下载目录失败: ${e.message}`));
+function showMo2Status(result, applySettings = false) {
+  if (result.ok === false) throw new Error(result.message || "读取安装状态失败");
+  if (result.settings && (applySettings || !mo2State.settingsLoaded)) {
+    if (!settingEdited("mo2Path")) $("mo2Path").value = result.settings.mo2Path || "F:\\Skyrim\\iniRePather-Skyrim";
+    if (!settingEdited("mo2Enabled")) $("mo2Enabled").checked = result.settings.enabled !== false;
+    if (!settingEdited("mo2DeleteArchive")) $("mo2DeleteArchive").checked = result.settings.deleteAfterInstall === true;
+    mo2State.settingsLoaded = true;
+  }
+  const bridge = result.bridge || {};
+  const labels = { ready: "已连接", installing: "安装中", unavailable: "未连接", needs_restart: "需重启", not_configured: "待设置" };
+  $("mo2Chip").textContent = labels[bridge.state] || "未连接";
+  $("mo2Chip").title = bridge.message || "";
+  $("mo2Chip").className = "chip " + (bridge.state === "ready" ? "chip-ok" : "chip-warn");
+  $("mo2Connection").textContent = "";
+  $("mo2Connection").classList.add("hidden");
+  $("mo2Connection").classList.toggle("is-ready", bridge.state === "ready");
+  if (Array.isArray(result.jobs)) {
+    mo2State.jobs = result.jobs;
+    renderMo2Jobs();
+  }
+}
+
+async function refreshMo2Status() {
+  if (mo2State.polling) return;
+  mo2State.polling = true;
+  try {
+    showMo2Status(await api("/api/mo2/status"));
+  } catch (error) {
+    $("mo2Chip").textContent = "连接中断";
+    $("mo2Chip").className = "chip chip-warn";
+    $("mo2Connection").classList.remove("is-ready");
+    $("mo2Connection").textContent = error.message;
+    $("mo2Connection").classList.remove("hidden");
+  } finally {
+    mo2State.polling = false;
+  }
+}
+
+function startMo2Watcher() {
+  refreshMo2Status();
+  if (!mo2State.timer && !PREVIEW_MODE) mo2State.timer = setInterval(refreshMo2Status, 2000);
+}
+
+
+function renderMo2Jobs() {
+  const jobs = mo2State.jobs;
+  const ids = new Set(jobs.map((job) => String(job.id)));
+  for (const [id, record] of mo2State.rows) {
+    if (!ids.has(id)) { record.row.remove(); mo2State.rows.delete(id); mo2State.drafts.delete(id); }
+  }
+  let active = 0;
+  let history = 0;
+  let awaiting = 0;
+  for (const job of jobs) {
+    const id = String(job.id);
+    const completed = (job.state === "installed" && !job.cleanupError) || job.state === "cancelled";
+    const parent = completed ? $("mo2HistoryJobs") : $("mo2Jobs");
+    if (completed) history++; else active++;
+    if (job.state === "awaiting_confirmation") awaiting++;
+    // 不在轮询中重建未改变的卡片，避免打断输入、候选下拉框和键盘焦点。
+    const signature = JSON.stringify(job);
+    const record = mo2State.rows.get(id);
+    if (record && (record.signature === signature || mo2State.busy.has(id))) continue;
+    const oldInput = record && record.row.querySelector(".mo2-name-input");
+    const selection = oldInput && document.activeElement === oldInput
+      ? [oldInput.selectionStart, oldInput.selectionEnd, oldInput.selectionDirection] : null;
+    const detailsOpen = record?.row.querySelector(".mo2-job-details")?.open;
+    const row = buildMo2Job(job);
+    if (detailsOpen && row.querySelector(".mo2-job-details")) row.querySelector(".mo2-job-details").open = true;
+    if (record && record.row.parentElement === parent) record.row.replaceWith(row);
+    else { if (record) record.row.remove(); parent.appendChild(row); }
+    mo2State.rows.set(id, { row, signature });
+    const newInput = selection && row.querySelector(".mo2-name-input");
+    if (newInput) {
+      newInput.focus({ preventScroll: true });
+      newInput.setSelectionRange(...selection);
+    }
+  }
+  $("mo2Empty").classList.toggle("hidden", active > 0);
+  $("mo2History").classList.toggle("hidden", !history);
+  $("mo2HistorySummary").textContent = `历史 · ${history}`;
+  $("mo2JobCount").textContent = awaiting ? `${awaiting} 待确认` : (active ? String(active) : "");
+}
+
+function buildMo2Job(job) {
+  const id = String(job.id);
+  const waiting = job.state === "awaiting_confirmation";
+  const displayName = job.state === "installed" ? (job.installedName || job.installName) : job.installName;
+  const labels = { awaiting_confirmation: "待确认", queued: "排队", installing: "安装中", installed: "已安装", cancelled: "已跳过", error: "失败" };
+  const row = mo2Element("article", "mo2-job" + (waiting ? " is-waiting" : "") + (job.state === "error" ? " is-error" : ""));
+  const heading = mo2Element("div", "mo2-job-heading");
+  heading.append(mo2Element("div", "mo2-job-title", job.filename || job.installName || "模组安装包"),
+    mo2Element("span", "chip " + (job.state === "error" ? "mo2-chip-error" : waiting ? "chip-warn" : ""), labels[job.state] || job.state));
+  row.appendChild(heading);
+  if (job.archivePath || job.matchReason) {
+    const details = mo2Element("details", "mo2-job-details");
+    details.appendChild(mo2Element("summary", "", "详情"));
+    if (job.matchReason) details.appendChild(mo2Element("p", "mo2-job-reason", job.matchReason));
+    if (job.archivePath) details.appendChild(mo2Element("p", "mo2-job-path", job.archivePath));
+    row.appendChild(details);
+  }
+  const error = mo2Element("div", "mo2-job-error hidden");
+  error.setAttribute("role", "alert");
+  if (waiting) {
+    if (!mo2State.drafts.has(id)) mo2State.drafts.set(id, job.installName || job.suggestedName || "");
+    const form = mo2Element("form", "mo2-confirm-form");
+    const label = mo2Element("label", "mo2-name-label");
+    label.appendChild(mo2Element("span", "", "安装名称"));
+    const input = mo2Element("input", "mo2-name-input");
+    input.type = "text";
+    input.required = true;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.value = mo2State.drafts.get(id);
+    input.placeholder = "模组名称";
+    input.addEventListener("input", () => { mo2State.drafts.set(id, input.value); input.setCustomValidity(""); });
+    label.appendChild(input);
+    form.appendChild(label);
+    const candidates = Array.isArray(job.candidates) ? job.candidates : [];
+    if (candidates.length) {
+      const candidatesLabel = mo2Element("label", "mo2-candidates-label");
+      candidatesLabel.appendChild(mo2Element("span", "", "候选"));
+      const select = mo2Element("select", "mo2-candidates");
+      const placeholder = mo2Element("option", "", "已安装模组");
+      placeholder.value = "";
+      select.appendChild(placeholder);
+      for (const candidate of candidates) {
+        const option = mo2Element("option", "", candidate.name);
+        option.value = candidate.name;
+        option.title = candidate.reason || "";
+        select.appendChild(option);
+      }
+      select.addEventListener("change", () => {
+        if (!select.value) return;
+        input.value = select.value;
+        input.setCustomValidity("");
+        mo2State.drafts.set(id, select.value);
+        const reason = row.querySelector(".mo2-job-reason");
+        if (reason) reason.textContent = candidates.find((candidate) => candidate.name === select.value)?.reason || job.matchReason || "";
+      });
+      candidatesLabel.appendChild(select);
+      form.appendChild(candidatesLabel);
+    }
+    const actions = mo2Element("div", "mo2-job-actions");
+    const confirm = mo2Element("button", "btn btn-primary", "安装");
+    confirm.title = "确认名称并安装";
+    confirm.type = "submit";
+    const skip = mo2Element("button", "btn", "跳过");
+    skip.title = "跳过安装，保留安装包";
+    skip.type = "button";
+    skip.addEventListener("click", () => mo2JobAction(job, "skip", {}, row, error));
+    actions.append(confirm, skip);
+    form.appendChild(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const installName = input.value.trim();
+      if (!installName || /[<>:"/\\|?*\x00-\x1F]/.test(installName) || /[. ]$/.test(installName) || installName === "." || installName === "..") {
+        input.setCustomValidity("请输入有效的模组文件夹名称，不能包含 \\ / : * ? \" < > | 或以句点结尾。");
+        input.reportValidity();
+        return;
+      }
+      mo2JobAction(job, "confirm", { installName }, row, error);
+    });
+    row.appendChild(form);
+  } else if (displayName) {
+    row.appendChild(mo2Element("p", "mo2-job-message", displayName));
+  }
+  if (job.state === "error" && job.message) row.appendChild(mo2Element("p", "mo2-job-error", job.message));
+  if (job.state === "installing") row.appendChild(mo2Element("p", "mo2-job-message", "等待 MO2 操作"));
+  if (job.archiveDeleted) row.appendChild(mo2Element("p", "mo2-job-message", "安装包已删除"));
+  if (job.cleanupError) row.appendChild(mo2Element("p", "mo2-job-error", `清理失败：${job.cleanupError}`));
+  if ((job.state === "error" || job.state === "cancelled") && !job.archiveDeleted) {
+    const actions = mo2Element("div", "mo2-job-actions");
+    const retry = mo2Element("button", "btn", "重试");
+    retry.type = "button";
+    retry.addEventListener("click", () => mo2JobAction(job, "retry", {}, row, error));
+    actions.appendChild(retry);
+    row.appendChild(actions);
+  }
+  row.appendChild(error);
+  return row;
+}
+
+async function mo2JobAction(job, action, payload, row, errorElement) {
+  const id = String(job.id);
+  if (mo2State.busy.has(id)) return;
+  mo2State.busy.add(id);
+  row.querySelectorAll("button, input, select").forEach((element) => { element.disabled = true; });
+  errorElement.classList.add("hidden");
+  try {
+    const result = await api(`/api/mo2/jobs/${encodeURIComponent(id)}/${action}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    if (result.ok === false) throw new Error(result.message || "操作失败");
+    mo2State.busy.delete(id);
+    if (Array.isArray(result.jobs)) showMo2Status(result);
+    else await refreshMo2Status();
+  } catch (error) {
+    errorElement.textContent = error.message;
+    errorElement.classList.remove("hidden");
+  } finally {
+    mo2State.busy.delete(id);
+    row.querySelectorAll("button, input, select").forEach((element) => { element.disabled = false; });
+  }
+}
+
+/* 背景：预加载后淡入，每五分钟随机切换。 */
+const wallpaperState = {
+  settings: null, dirty: false, timer: null, nextAt: 0,
+  version: 0, settingsRevision: 0, loadingVersion: null, token: "", activeLayer: 0,
+  imageUrls: [null, null],
+};
+const wallpaperPreview = {
+  settings: { ok: true, enabled: true, directory: "E:\\BaiduSyncdisk\\壁纸图片", opacity: .22, intervalSeconds: 300 },
+  next: { ok: false, message: "暂无图片" },
+};
+
+function previewWallpaperApi(path, options) {
+  if (path === "/api/wallpaper/settings") {
+    if (options?.body) Object.assign(wallpaperPreview.settings, JSON.parse(options.body));
+    return { ...wallpaperPreview.settings };
+  }
+  return { ...wallpaperPreview.next };
+}
+
+function wallpaperMessage(message = "") {
+  $("wallpaperStatus").textContent = message;
+  $("wallpaperStatus").classList.toggle("hidden", !message);
+}
+
+function previewWallpaperOpacity() {
+  const transparency = Number($("wallpaperOpacity").value);
+  $("wallpaperOpacityValue").textContent = `${transparency}%`;
+  document.documentElement.style.setProperty("--wallpaper-opacity", String((100 - transparency) / 100));
+}
+
+function stopWallpaperTimer() {
+  if (wallpaperState.timer) clearTimeout(wallpaperState.timer);
+  wallpaperState.timer = null;
+  wallpaperState.nextAt = 0;
+}
+
+function scheduleWallpaper(version, delay = 300000) {
+  stopWallpaperTimer();
+  if (version !== wallpaperState.version || !wallpaperState.settings?.enabled) return;
+  wallpaperState.nextAt = Date.now() + delay;
+  wallpaperState.timer = setTimeout(() => rotateWallpaper(version), delay);
+}
+
+function preloadWallpaper(url) {
+  return new Promise((resolve, reject) => {
+    const picture = new Image();
+    picture.decoding = "async";
+    picture.fetchPriority = "low";
+    const timeout = setTimeout(() => {
+      picture.onload = picture.onerror = null;
+      picture.src = "";
+      reject(new Error("图片读取超时"));
+    }, 20000);
+    picture.onload = async () => {
+      try {
+        if (picture.decode) await picture.decode();
+        resolve();
+      } catch { reject(new Error("图片读取失败")); }
+      finally { clearTimeout(timeout); }
+    };
+    picture.onerror = () => { clearTimeout(timeout); reject(new Error("图片读取失败")); };
+    picture.src = url;
+  });
+}
+
+async function rotateWallpaper(version = wallpaperState.version) {
+  if (version !== wallpaperState.version || !wallpaperState.settings?.enabled || wallpaperState.loadingVersion === version) return;
+  wallpaperState.loadingVersion = version;
+  stopWallpaperTimer();
+  let delay = 300000;
+  let preparedUrl = null;
+  try {
+    const metadataAbort = new AbortController();
+    const metadataTimer = setTimeout(() => metadataAbort.abort(), 20000);
+    let result;
+    try {
+      result = await api(`/api/wallpaper/next?exclude=${encodeURIComponent(wallpaperState.token)}`, { signal: metadataAbort.signal });
+    } finally { clearTimeout(metadataTimer); }
+    if (version !== wallpaperState.version) return;
+    if (!result.ok) throw new Error(result.message || "暂无图片");
+    if (typeof result.url !== "string" || !result.url.startsWith("/api/wallpaper/image/")) throw new Error("图片地址无效");
+    const abort = new AbortController();
+    const fetchTimer = setTimeout(() => abort.abort(), 20000);
+    try {
+      const response = await fetch(result.url, { signal: abort.signal, cache: "no-store" });
+      if (!response.ok) throw new Error("图片读取失败");
+      preparedUrl = URL.createObjectURL(await response.blob());
+    } finally { clearTimeout(fetchTimer); }
+    await preloadWallpaper(preparedUrl);
+    if (version !== wallpaperState.version) return;
+    const previous = wallpaperState.activeLayer;
+    const next = 1 - previous;
+    const layers = [$("wallpaperA"), $("wallpaperB")];
+    const retiredUrl = wallpaperState.imageUrls[next];
+    layers[next].style.backgroundImage = `url(${JSON.stringify(preparedUrl)})`;
+    wallpaperState.imageUrls[next] = preparedUrl;
+    preparedUrl = null;
+    if (retiredUrl) URL.revokeObjectURL(retiredUrl);
+    layers[next].classList.add("is-visible");
+    layers[previous].classList.remove("is-visible");
+    wallpaperState.activeLayer = next;
+    wallpaperState.token = result.token || "";
+    $("wallpaperBackdrop").classList.toggle("hidden", !$("wallpaperEnabled").checked);
+    wallpaperMessage();
+  } catch (error) {
+    if (version === wallpaperState.version) wallpaperMessage(error.name === "AbortError" ? "图片读取超时" : error.message);
+    delay = 30000;
+  } finally {
+    if (preparedUrl) URL.revokeObjectURL(preparedUrl);
+    if (wallpaperState.loadingVersion === version) wallpaperState.loadingVersion = null;
+    if (version === wallpaperState.version) scheduleWallpaper(version, delay);
+  }
+}
+
+function applyWallpaperSettings(settings) {
+  const previous = wallpaperState.settings;
+  const sourceChanged = !previous || previous.directory !== settings.directory || previous.enabled !== settings.enabled;
+  wallpaperState.settings = { ...settings };
+  if (!settingEdited("wallpaperEnabled")) $("wallpaperEnabled").checked = settings.enabled;
+  if (!settingEdited("wallpaperDir")) $("wallpaperDir").value = settings.directory;
+  if (!settingEdited("wallpaperOpacity")) $("wallpaperOpacity").value = Math.round((1 - settings.opacity) * 100);
+  previewWallpaperOpacity();
+  if (!sourceChanged) return;
+  wallpaperState.version++;
+  stopWallpaperTimer();
+  wallpaperState.token = "";
+  if (!settings.enabled) {
+    for (const id of ["wallpaperA", "wallpaperB"]) {
+      $(id).classList.remove("is-visible");
+      $(id).style.backgroundImage = "";
+    }
+    wallpaperState.imageUrls.forEach((url) => { if (url) URL.revokeObjectURL(url); });
+    wallpaperState.imageUrls = [null, null];
+  }
+  $("wallpaperBackdrop").classList.toggle("hidden", !$("wallpaperEnabled").checked);
+  if (settings.enabled) rotateWallpaper(wallpaperState.version);
+  else wallpaperMessage();
+}
+
+async function loadWallpaperSettings() {
+  const revision = ++wallpaperState.settingsRevision;
+  try {
+    const settings = await api("/api/wallpaper/settings");
+    if (revision !== wallpaperState.settingsRevision) return;
+    if (!settings.ok) throw new Error(settings.message || "背景设置读取失败");
+    applyWallpaperSettings(settings);
+  } catch (error) {
+    if (revision === wallpaperState.settingsRevision) wallpaperMessage(error.message);
+  }
+}
+
+
+/* 设置逐项保存：输入防抖，请求串行，旧响应不能覆盖新输入。 */
+const settingFields = {
+  dlDirInput: ['download', '/api/download/dir', 'dir'],
+  threadRange: ['threads', '/api/takeover/threads', 'maxThreads'],
+  mo2Path: ['mo2', '/api/mo2/settings', 'mo2Path'],
+  mo2Enabled: ['mo2', '/api/mo2/settings', 'enabled'],
+  mo2DeleteArchive: ['mo2', '/api/mo2/settings', 'deleteAfterInstall'],
+  wallpaperDir: ['wallpaper', '/api/wallpaper/settings', 'directory'],
+  wallpaperEnabled: ['wallpaper', '/api/wallpaper/settings', 'enabled'],
+  wallpaperOpacity: ['wallpaper', '/api/wallpaper/settings', 'opacity'],
+  fontSizeRange: ['appearance', '/api/appearance/settings', 'fontSize'],
+};
+const settingsSave = {
+  pending: new Map(), revisions: new Map(), desired: new Map(), groups: new Map(),
+  errors: new Map(), timer: null, running: false, saved: false,
+};
+
+function settingEdited(id) { return settingsSave.revisions.has(id); }
+
+function displaySaveState() {
+  const messages = [...settingsSave.errors.values()];
+  const status = $('settingsSaveState');
+  status.textContent = messages.length ? '未保存' : settingsSave.running || settingsSave.pending.size ? '保存中…' : settingsSave.saved ? '已保存' : '';
+  status.title = messages.join('\n');
+  const notice = $('settingsNotice');
+  if (messages.length) {
+    if (settingsNoticeTimer) clearTimeout(settingsNoticeTimer);
+    notice.dataset.autosave = 'true';
+    notice.textContent = messages.join('\n');
+    notice.classList.remove('hidden');
+  } else if (notice.dataset.autosave) {
+    delete notice.dataset.autosave;
+    notice.textContent = '';
+    notice.classList.add('hidden');
+  }
+}
+
+function scheduleSettingsSave() {
+  if (settingsSave.timer) clearTimeout(settingsSave.timer);
+  settingsSave.timer = null;
+  if (!settingsSave.running && settingsSave.pending.size) {
+    const due = Math.min(...[...settingsSave.pending.values()].map(item => item.due));
+    settingsSave.timer = setTimeout(drainSettingsSave, Math.max(0, due - Date.now()));
+  }
+  displaySaveState();
+}
+
+function queueSetting(id, delay = 0) {
+  const control = $(id);
+  const [group, endpoint, field] = settingFields[id];
+  const value = control.type === 'checkbox' ? control.checked : control.type === 'range'
+    ? (id === 'wallpaperOpacity' ? (100 - Number(control.value)) / 100 : Number(control.value)) : control.value.trim();
+  if (settingsSave.desired.get(id) === value && !settingsSave.errors.has(id)) {
+    if (!delay && settingsSave.pending.has(id)) settingsSave.pending.get(id).due = Date.now();
+    scheduleSettingsSave();
+    return;
+  }
+  const revision = (settingsSave.revisions.get(id) || 0) + 1;
+  settingsSave.revisions.set(id, revision);
+  settingsSave.desired.set(id, value);
+  settingsSave.groups.set(group, (settingsSave.groups.get(group) || 0) + 1);
+  settingsSave.errors.delete(id);
+  control.removeAttribute('aria-invalid');
+  if (group === 'mo2') mo2State.settingsDirty = true;
+  if (group === 'wallpaper') { wallpaperState.dirty = true; wallpaperState.settingsRevision++; }
+  settingsSave.pending.set(id, { id, group, endpoint, field, value, revision, due: Date.now() + delay, attempts: 0 });
+  scheduleSettingsSave();
+}
+
+function flushSettingsSave() {
+  for (const item of settingsSave.pending.values()) item.due = Date.now();
+  scheduleSettingsSave();
+}
+
+async function drainSettingsSave() {
+  if (settingsSave.running) return;
+  const item = [...settingsSave.pending.values()].filter(value => value.due <= Date.now()).sort((a, b) => a.due - b.due)[0];
+  if (!item) { scheduleSettingsSave(); return; }
+  settingsSave.pending.delete(item.id);
+  settingsSave.running = true;
+  displaySaveState();
+  const groupRevision = settingsSave.groups.get(item.group);
+  let timeout;
+  try {
+    if (['dlDirInput', 'mo2Path', 'wallpaperDir'].includes(item.id) && !/^(?:[a-z]:[\\/]|\\\\[^\\]+\\[^\\]+|\/)/i.test(item.value)) {
+      const error = new Error('请填写完整目录'); error.status = 400; throw error;
+    }
+    const abort = new AbortController();
+    timeout = setTimeout(() => abort.abort(), 15000);
+    const result = await api(item.endpoint, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [item.field]: item.value }), signal: abort.signal, keepalive: true,
+    });
+    if (result.ok === false) throw new Error(result.message || '保存失败');
+    if (settingsSave.revisions.get(item.id) === item.revision) {
+      settingsSave.errors.delete(item.id);
+      $(item.id).removeAttribute('aria-invalid');
+      settingsSave.saved = true;
+    }
+    if (settingsSave.groups.get(item.group) === groupRevision) {
+      if (item.group === 'mo2') {
+        mo2State.settingsLoaded = true;
+        mo2State.settingsDirty = false;
+        showMo2Status(result, true);
+      } else if (item.group === 'wallpaper') {
+        wallpaperState.dirty = false;
+        applyWallpaperSettings(result);
+      }
+    }
+    // A corrected directory can make an earlier enable request valid.
+    for (const id of [...settingsSave.errors.keys()]) {
+      if (id !== item.id && settingFields[id][0] === item.group && !settingsSave.pending.has(id)) queueSetting(id);
+    }
+  } catch (error) {
+    if (settingsSave.revisions.get(item.id) === item.revision) {
+      const labels = { download: '下载目录', threads: '并发线程', mo2: 'MO2', wallpaper: '背景', appearance: '字体' };
+      settingsSave.errors.set(item.id, labels[item.group] + '：' + (error.name === 'AbortError' ? '保存超时' : error.message));
+      $(item.id).setAttribute('aria-invalid', 'true');
+      if (!error.status || error.status >= 500) {
+        item.attempts++;
+        item.due = Date.now() + Math.min(30000, 2000 * 2 ** Math.min(item.attempts - 1, 4));
+        settingsSave.pending.set(item.id, item);
+      }
+    }
+  } finally {
+    clearTimeout(timeout);
+    settingsSave.running = false;
+    scheduleSettingsSave();
+  }
+}
+
+function previewFontSize() {
+  const size = Number($('fontSizeRange').value);
+  $('fontSizeValue').textContent = size;
+  document.documentElement.style.setProperty('--font-scale', String(size / 13));
+}
+
+async function loadAppearance() {
+  try {
+    const result = await api('/api/appearance/settings');
+    if (!settingEdited('fontSizeRange') && result.ok && Number.isInteger(result.fontSize)) {
+      $('fontSizeRange').value = result.fontSize;
+      previewFontSize();
+    }
+  } catch { /* 默认字号不影响启动；下次修改会自动重试保存。 */ }
+}
+
+async function loadThreads() {
+  try {
+    const result = await api('/api/takeover/threads');
+    if (!settingEdited('threadRange') && result.maxThreads) {
+      $('threadRange').value = result.maxThreads;
+      $('threadValue').textContent = result.maxThreads;
+    }
+  } catch { /* 宿主未就绪时保持默认 256。 */ }
 }
 
 /* ----------------------------------------------------------------- events */
 function wireEvents() {
+  const settingsDialog = $("settingsDialog");
+  $("btnSettings").addEventListener("click", () => {
+    if (!settingsDialog.open) {
+      hideNotice();
+      settingsDialog.showModal();
+      document.body.classList.add("dialog-open");
+      displaySaveState();
+    }
+  });
+  $("btnSettingsClose").addEventListener("click", () => settingsDialog.close());
+  settingsDialog.addEventListener("close", () => {
+    flushSettingsSave();
+    document.body.classList.remove("dialog-open");
+    if (settingsNoticeTimer) clearTimeout(settingsNoticeTimer);
+    $("settingsNotice").classList.add("hidden");
+    $("settingsNotice").textContent = "";
+  });
+  settingsDialog.addEventListener("click", (event) => {
+    if (event.target !== settingsDialog) return;
+    const bounds = settingsDialog.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) settingsDialog.close();
+  });
   $("btnRefresh").addEventListener("click", () => startRefresh(true));
   $("btnDiscardToggle").addEventListener("click", () => {
     state.showDiscarded = !state.showDiscarded;
@@ -977,20 +1572,87 @@ function wireEvents() {
   $("btnProfile").addEventListener("click", async () => {
     try {
       await api("/api/auth/profile", { method: "POST" });
-      setNotice("正在加载浏览器资料；若窗口空白请手动打开 N 网并登录，完成后自动继续");
+      setNotice("等待浏览器登录");
       pollLoginImport();
     } catch (e) {
       setNotice(`启动失败: ${e.message}`);
     }
   });
 
-  $("btnDlDir").addEventListener("click", saveDir);
-  $("btnBrowseDir").addEventListener("click", () => browseDir("dlDirInput"));
-  $("noticeClose").addEventListener("click", hideNotice);
-  $("threadRange").addEventListener("input", () => {
-    $("threadValue").textContent = $("threadRange").value;
+
+  $('noticeClose').addEventListener('click', hideNotice);
+  for (const id of Object.keys(settingFields)) {
+    const control = $(id);
+    control.addEventListener('compositionstart', () => {
+      settingsSave.revisions.set(id, (settingsSave.revisions.get(id) || 0) + 1);
+      const group = settingFields[id][0];
+      settingsSave.groups.set(group, (settingsSave.groups.get(group) || 0) + 1);
+      settingsSave.pending.delete(id);
+      settingsSave.desired.delete(id);
+      if (group === 'wallpaper') wallpaperState.settingsRevision++;
+      scheduleSettingsSave();
+    });
+    control.addEventListener('input', event => {
+      if (id === 'threadRange') $('threadValue').textContent = control.value;
+      if (id === 'wallpaperOpacity') previewWallpaperOpacity();
+      if (id === 'fontSizeRange') previewFontSize();
+      if (id === 'wallpaperEnabled') $('wallpaperBackdrop').classList.toggle('hidden', !control.checked);
+      if (!event.isComposing) queueSetting(id, control.type === 'checkbox' ? 0 : control.type === 'range' ? 150 : 550);
+    });
+    control.addEventListener('change', () => queueSetting(id));
+    control.addEventListener('compositionend', () => queueSetting(id, 550));
+    control.addEventListener('blur', () => {
+      if (settingsSave.pending.has(id)) { settingsSave.pending.get(id).due = Date.now(); scheduleSettingsSave(); }
+    });
+    control.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); queueSetting(id); }
+    });
+  }
+  for (const id of ['mo2Settings', 'wallpaperSettings']) {
+    $(id).addEventListener('submit', event => { event.preventDefault(); flushSettingsSave(); });
+  }
+  for (const [button, input] of [['btnBrowseDir', 'dlDirInput'], ['btnMo2Browse', 'mo2Path'], ['btnWallpaperBrowse', 'wallpaperDir']]) {
+    $(button).addEventListener('click', async () => {
+      const previous = $(input).value;
+      await browseDir(input);
+      if ($(input).value !== previous) queueSetting(input);
+    });
+  }
+  let searchFrame = null;
+  $("modSearch").addEventListener("input", () => {
+    state.query = $("modSearch").value;
+    if (searchFrame) cancelAnimationFrame(searchFrame);
+    searchFrame = requestAnimationFrame(() => { searchFrame = null; renderList(); });
   });
-  $("threadRange").addEventListener("change", saveThreads);
+  const clearSearch = () => {
+    $("modSearch").value = state.query = "";
+    renderList();
+    $("modSearch").focus({ preventScroll: true });
+  };
+  $("btnClearSearch").addEventListener("click", clearSearch);
+  $("modSearch").addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !settingsDialog.open) { event.preventDefault(); clearSearch(); }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.defaultPrevented || event.isComposing || settingsDialog.open) return;
+    if ((event.ctrlKey || event.metaKey) && event.key === ",") {
+      event.preventDefault();
+      $("btnSettings").click();
+      return;
+    }
+    const target = event.target;
+    const editing = target?.matches?.("input, textarea, select") || target?.isContentEditable;
+    if (event.key === "/" && !event.ctrlKey && !event.metaKey && !event.altKey && !editing) {
+      event.preventDefault();
+      $("modSearch").focus({ preventScroll: true });
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) flushSettingsSave();
+    if (!document.hidden && wallpaperState.nextAt && Date.now() >= wallpaperState.nextAt) rotateWallpaper();
+  });
+  window.addEventListener("pagehide", () => { flushSettingsSave(); drainSettingsSave(); wallpaperState.version++; stopWallpaperTimer(); });
+  window.addEventListener("pageshow", (event) => { if (event.persisted) rotateWallpaper(); });
 }
 
 /* ------------------------------------------------------------------- boot */
@@ -998,6 +1660,9 @@ async function boot() {
   if (PREVIEW_MODE) document.body.classList.add("preview");
   loadDlMarks();           // 恢复本地“已下载”实时标记（必须在首次渲染之前）
   wireEvents();
+  startMo2Watcher();
+  loadWallpaperSettings();
+  loadAppearance();
   await refreshStatus(true);
   await loadMods(true);
   await loadDiscarded();

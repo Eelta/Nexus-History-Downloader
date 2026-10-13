@@ -18,28 +18,28 @@ internal static class Program
 {
     private const string Version = "1.0.0";
     private const int DefaultPort = 18765;
-    // 实测（本机 64MB 回环 + Python 服务器）8/16/32/64/128/256 六档中 8~64 最快，
-    // 256 明显变慢（服务器端瓶颈）；而 Nexus CDN 单连接限速场景下高并发仍有意义。
-    // 权衡后默认取 64（APP 可设 CUSTOMDL_MAX_THREADS 覆盖）。
-    private const int DefaultMaxThreads = 64;
+    // 默认使用界面滑块上限；环境变量 CUSTOMDL_MAX_THREADS 仍可覆盖。
+    private const int DefaultMaxThreads = 256;
     private const int MaxParallelJobs = 5;
     private const long MaxBodyBytes = 1024 * 1024;
     private const double MaxCorsAgeSeconds = 86400;
 
     private static readonly object Sync = new();
+    private static readonly object LogSync = new();
     private static readonly List<JobSnapshot> Jobs = new();
     private static readonly Dictionary<string, CancellationTokenSource> JobCtss = new();
     // 并行下载任务数：默认 5（环境变量 CUSTOMDL_MAX_JOBS 可调 1~16），超出排队
     private static readonly SemaphoreSlim WorkerGate = new(JobSlots(), JobSlots());
     private static readonly string RootDir = Path.GetFullPath(Environment.CurrentDirectory);
     private static readonly string CacheDir = Path.Combine(RootDir, "cache");
+    private static readonly string HistoryPath = Path.Combine(CacheDir, "takeover-history.jsonl");
     private static readonly string SettingsPath = Path.Combine(RootDir, "settings.json");
     private static string DefaultDir = CacheDir;
     private static int _seq;
     private static readonly string StartedAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
 
     /// <summary>当前最大并发线程数：可运行时调整（/api/settings 或环境变量初始值）。</summary>
-    private static volatile int MaxThreads = EnvMaxThreads();
+    private static volatile int MaxThreads = EnvMaxThreads() ?? DefaultMaxThreads;
 
     private static int Port
     {
@@ -50,10 +50,10 @@ internal static class Program
         }
     }
 
-    private static int EnvMaxThreads()
+    private static int? EnvMaxThreads()
     {
         var raw = Environment.GetEnvironmentVariable("CUSTOMDL_MAX_THREADS");
-        return int.TryParse(raw, out var v) && v is > 0 and <= 4096 ? v : DefaultMaxThreads;
+        return int.TryParse(raw, out var v) && v is > 0 and <= 4096 ? v : null;
     }
 
     /// <summary>并行下载任务数：环境变量 CUSTOMDL_MAX_JOBS（默认 5，范围 1~16）。</summary>
@@ -70,11 +70,12 @@ internal static class Program
         Console.OutputEncoding = Encoding.UTF8;
         LoadSettings();
         Directory.CreateDirectory(CacheDir);
+        LoadJobHistory();
 
         Console.WriteLine($"CustomFileDownloader engine host v{Version}");
         Console.WriteLine($"  HTTP endpoint : {BaseUrl}  (env CUSTOMDL_HOST_PORT to change)");
         Console.WriteLine($"  default save  : {DefaultDir}");
-        Console.WriteLine($"  max threads   : {MaxThreads}  (env CUSTOMDL_MAX_THREADS / 页面滑块可调, default 64)");
+        Console.WriteLine($"  max threads   : {MaxThreads}  (env CUSTOMDL_MAX_THREADS / 页面滑块可调, default 256)");
         Console.WriteLine($"  parallel jobs : {JobSlots()}  (env CUSTOMDL_MAX_JOBS, default 5, 超出排队)");
         Console.WriteLine($"  job log       : {Path.Combine(CacheDir, "takeover-jobs.jsonl")}");
         Console.WriteLine("Waiting for takeover requests from the dashboard window... (Ctrl+C to exit)");
@@ -102,6 +103,7 @@ internal static class Program
     private sealed class AppSettingsJson
     {
         public string? DefaultDownloadDir { get; set; }
+        public int? MaxThreads { get; set; }
     }
 
     private static void LoadSettings()
@@ -113,6 +115,8 @@ internal static class Program
                 var s = JsonSerializer.Deserialize<AppSettingsJson>(File.ReadAllText(SettingsPath));
                 if (!string.IsNullOrWhiteSpace(s?.DefaultDownloadDir))
                     DefaultDir = Path.GetFullPath(s.DefaultDownloadDir);
+                if (EnvMaxThreads() is null && s?.MaxThreads is > 0 and <= 4096)
+                    MaxThreads = s.MaxThreads.Value;
             }
         }
         catch (Exception ex)
@@ -266,7 +270,7 @@ internal static class Program
         lock (Sync)
         {
             _seq++;
-            var id = $"T{_seq:000}";
+            var id = $"T{_seq:000}-{Guid.NewGuid():N}";
             var savePath = ResolveSavePath(req);
             snap = new JobSnapshot
             {
@@ -274,6 +278,11 @@ internal static class Program
                 Url = req.Url,
                 Filename = Path.GetFileName(savePath),
                 SavePath = savePath,
+                Game = req.Game,
+                ModId = req.ModId,
+                FileId = req.FileId,
+                ModName = req.ModName,
+                Referrer = req.Referrer,
                 State = "queued",
                 StartedAt = Now(),
             };
@@ -311,7 +320,7 @@ internal static class Program
 
             dl = new SegmentedDownloader(new DownloadOptions
             {
-                OverwriteExisting = true,
+                OverwriteExisting = false,
                 SimulateBrowserHeaders = headers.ContainsKey("Cookie"),
                 Headers = headers.Count > 0 ? headers : null,
                 RootDirectory = RootDir,
@@ -390,10 +399,12 @@ internal static class Program
             if (string.IsNullOrEmpty(headerName) || !string.IsNullOrEmpty(Path.GetExtension(cur)))
                 return savePath;
             var dir = Path.GetDirectoryName(savePath) ?? ".";
-            var newPath = Path.Combine(dir, SanitizeFileName(headerName) ?? headerName);
-            if (string.Equals(Path.GetFullPath(newPath), Path.GetFullPath(savePath), StringComparison.OrdinalIgnoreCase))
-                return savePath;
-            File.Move(savePath, newPath, overwrite: true);
+            string newPath;
+            lock (Sync)
+            {
+                newPath = UniqueSavePath(dir, SanitizeFileName(headerName) ?? headerName);
+                File.Move(savePath, newPath, overwrite: false);
+            }
             Console.WriteLine($"[Takeover #{jobId}] filename fixed by Content-Disposition: {Path.GetFileName(newPath)}");
             return newPath;
         }
@@ -412,24 +423,23 @@ internal static class Program
             dir = Path.GetFullPath(req.SaveDir);
         var name = SanitizeFileName(req.Filename) ?? SuggestFileName(req.Url);
         Directory.CreateDirectory(dir);
-        return UniquePathInActiveJobs(dir, name);
+        return UniqueSavePath(dir, name);
     }
 
     /// <summary>
-    /// 同名文件唯一化：若该保存路径正被「排队中/下载中」的任务占用，
-    /// 自动追加 " (1)"、" (2)"…（避免并发/排队下载同一个文件时互相覆盖）。
-    /// 磁盘上已存在的旧成品仍按原语义覆盖。
+    /// 同名文件唯一化：保留磁盘已有安装包，也避免并发任务写入同一路径。
+    /// 自动追加 " (1)"、" (2)"…；调用者持有 Sync 防止排队和改名互相抢占。
     /// </summary>
-    private static string UniquePathInActiveJobs(string dir, string name)
+    private static string UniqueSavePath(string dir, string name)
     {
         var candidate = Path.Combine(dir, name);
-        if (!ActiveJobTakesPath(candidate)) return candidate;
+        if (!File.Exists(candidate) && !Directory.Exists(candidate) && !ActiveJobTakesPath(candidate)) return candidate;
         var stem = Path.GetFileNameWithoutExtension(name);
         var ext = Path.GetExtension(name);
         for (var i = 1; i <= 50; i++)
         {
             var alt = Path.Combine(dir, $"{stem} ({i}){ext}");
-            if (!ActiveJobTakesPath(alt)) return alt;
+            if (!File.Exists(alt) && !Directory.Exists(alt) && !ActiveJobTakesPath(alt)) return alt;
         }
         return Path.Combine(dir, $"{stem} ({Guid.NewGuid():N}){ext}");
     }
@@ -496,17 +506,65 @@ internal static class Program
         return baseName.All(ch => Uri.IsHexDigit(ch) || ch == '-');
     }
 
+    private static bool IsTerminal(JobSnapshot snap) => snap.State is "done" or "error" or "canceled";
+
+    private static void LoadJobHistory()
+    {
+        // 完成记录与高频进度日志分离：后者轮转不应丢失待安装包或 Nexus 身份。
+        var known = new Dictionary<string, JobSnapshot>(StringComparer.Ordinal);
+        var migrate = new List<JobSnapshot>();
+        foreach (var path in new[] { HistoryPath, Path.Combine(CacheDir, "takeover-jobs.jsonl") })
+        {
+            try
+            {
+                if (!File.Exists(path)) continue;
+                foreach (var line in File.ReadLines(path))
+                {
+                    try
+                    {
+                        var snap = NativeJson.Deserialize<JobSnapshot>(line);
+                        if (snap is null || !IsTerminal(snap) || string.IsNullOrEmpty(snap.Id)) continue;
+                        var key = $"{snap.Id}\n{snap.StartedAt}\n{snap.SavePath}";
+                        if (known.TryAdd(key, snap) && path != HistoryPath) migrate.Add(snap);
+                    }
+                    catch (JsonException) { /* 忽略断电时尚未写完的行，保留原文件。 */ }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[log] history read failed: {ex.Message}");
+            }
+        }
+        Jobs.AddRange(known.Values.OrderBy(j => j.StartedAt, StringComparer.Ordinal));
+        _seq = Jobs.Count;
+        try
+        {
+            if (migrate.Count > 0)
+                File.AppendAllLines(HistoryPath, migrate.Select(j => NativeJson.Serialize(j)));
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[log] history migration failed: {ex.Message}");
+        }
+    }
+
     private static void AppendJsonl(JobSnapshot snap)
     {
         try
         {
-            var path = Path.Combine(CacheDir, "takeover-jobs.jsonl");
-            if (File.Exists(path) && new FileInfo(path).Length > 2 * 1024 * 1024)
+            lock (LogSync)
             {
-                // keep the tail so the file never grows without bound
-                File.WriteAllLines(path, File.ReadLines(path).TakeLast(200));
+                var line = NativeJson.Serialize(snap) + Environment.NewLine;
+                if (IsTerminal(snap)) File.AppendAllText(HistoryPath, line);
+                var path = Path.Combine(CacheDir, "takeover-jobs.jsonl");
+                if (File.Exists(path) && new FileInfo(path).Length > 2 * 1024 * 1024)
+                {
+                    // Materialize before truncating the same file. Terminal history is never rotated.
+                    var tail = File.ReadLines(path).TakeLast(200).ToArray();
+                    File.WriteAllLines(path, tail);
+                }
+                File.AppendAllText(path, line);
             }
-            File.AppendAllText(path, JsonSerializer.Serialize(snap, NativeJson.Options) + Environment.NewLine);
         }
         catch (Exception ex)
         {

@@ -3,60 +3,154 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Nexus Mods · 天际下载仪表盘</title>
-  <link rel="stylesheet" href="static/style.css?v=26" />
+  <meta name="color-scheme" content="dark" />
+  <title>NHD · 模组管理</title>
+  <link rel="stylesheet" href="static/style.css?v=31" />
 </head>
 <body>
-  <header class="topbar glass">
-    <div class="topbar-left">
-      <h1>天际模组更新监测</h1>
-      <span id="demoBadge" class="chip chip-warn hidden">演示数据</span>
-    </div>
-    <div class="topbar-right">
-      <div class="status-chips">
-        <span id="authChip" class="chip">会话: 检测中…</span>
-        <span id="countChip" class="chip">模组: 0</span>
-        <span id="filterChip" class="chip">筛选: -</span>
-        <span id="refreshChip" class="chip">数据: -</span>
+  <div id="wallpaperBackdrop" class="wallpaper-backdrop hidden" aria-hidden="true">
+    <div id="wallpaperA" class="wallpaper-layer"></div>
+    <div id="wallpaperB" class="wallpaper-layer"></div>
+  </div>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">NHD</span>
+        <h1>模组管理</h1>
+        <span id="demoBadge" class="chip chip-warn hidden">演示</span>
       </div>
-      <button id="btnRefresh" class="btn btn-primary">刷新数据</button>
-      <button id="btnProfile" class="btn">浏览器登录</button>
-      <button id="btnDiscardToggle" class="btn">历史丢弃 (0)</button>
+      <div class="topbar-actions">
+        <span id="authChip" class="chip">检测中…</span>
+        <button id="btnProfile" class="btn btn-quiet" type="button">登录</button>
+        <button id="btnSettings" class="btn" type="button" aria-haspopup="dialog">设置</button>
+        <button id="btnRefresh" class="btn btn-primary" type="button">刷新</button>
+      </div>
     </div>
   </header>
 
-  <div class="dirbar">
-    <span class="dirbar-label">默认下载目录</span>
-    <input id="dlDirInput" class="dirbar-input" type="text" spellcheck="false" placeholder="例如 D:\Downloads">
-    <button id="btnBrowseDir" class="btn" type="button">浏览…</button>
-    <button id="btnDlDir" class="btn" type="button">设为默认</button>
-    <span class="dirbar-label">并发线程</span>
-    <input id="threadRange" class="thread-range" type="range" min="8" max="256" step="8" value="64" title="最大并发连接数（实时生效于新任务）">
-    <span id="threadValue" class="dirbar-label thread-value">64</span>
+  <div class="workspace">
+    <section class="library" aria-labelledby="workspaceTitle">
+      <div class="section-heading">
+        <div class="section-title">
+          <h2 id="workspaceTitle">模组更新</h2>
+          <span id="countChip" class="chip count-chip">0</span>
+        </div>
+        <div class="library-actions">
+          <div class="library-search">
+            <input id="modSearch" type="search" placeholder="搜索模组" aria-label="搜索模组" autocomplete="off" spellcheck="false">
+            <button id="btnClearSearch" class="search-clear hidden" type="button" title="清除搜索" aria-label="清除搜索">×</button>
+          </div>
+          <button id="btnDiscardToggle" class="btn btn-quiet" type="button">归档 · 0</button>
+        </div>
+      </div>
+      <div class="library-meta">
+        <span id="filterChip">—</span>
+        <span id="refreshChip">—</span>
+      </div>
+
+      <section id="progressBar" class="progress hidden" aria-live="polite">
+        <span id="progressText"></span>
+        <div class="progress-track"><div class="progress-inner"></div></div>
+      </section>
+
+      <section id="notice" class="notice hidden" role="status">
+        <span id="noticeText"></span>
+        <button id="noticeClose" class="notice-x hidden" type="button" title="关闭" aria-label="关闭提示">×</button>
+      </section>
+
+      <section id="dlProgress" class="dlprogress hidden" aria-labelledby="downloadHeading">
+        <h3 id="downloadHeading">下载队列</h3>
+        <div id="dlList" class="dl-list"></div>
+      </section>
+
+      <main id="modList" class="mod-list"></main>
+      <section id="empty" class="empty hidden"><p>暂无模组</p></section>
+    </section>
+
+    <aside class="mo2-panel" aria-labelledby="mo2Heading">
+      <div class="mo2-heading">
+        <div class="section-title">
+          <h2 id="mo2Heading">MO2 安装</h2>
+          <span id="mo2JobCount" class="mo2-muted"></span>
+        </div>
+        <span id="mo2Chip" class="chip">检测中…</span>
+      </div>
+      <p id="mo2Connection" class="mo2-connection" role="status">正在连接…</p>
+      <div id="mo2Jobs" class="mo2-jobs"></div>
+      <p id="mo2Empty" class="mo2-empty">暂无任务</p>
+      <details id="mo2History" class="mo2-history hidden">
+        <summary id="mo2HistorySummary">已完成</summary>
+        <div id="mo2HistoryJobs" class="mo2-jobs"></div>
+      </details>
+    </aside>
   </div>
 
-  <div id="dlProgress" class="dlprogress hidden">
-    <div id="dlList" class="dl-list"></div>
-  </div>
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsHeading">
+    <div class="dialog-heading">
+      <div class="dialog-heading-title">
+        <h2 id="settingsHeading">设置</h2>
+        <span id="settingsSaveState" class="settings-save-state" role="status" aria-live="polite"></span>
+      </div>
+      <button id="btnSettingsClose" class="icon-btn" type="button" title="关闭" aria-label="关闭设置">×</button>
+    </div>
+    <div class="dialog-content">
+      <p id="settingsNotice" class="settings-notice hidden" role="status"></p>
+      <section class="settings-section" aria-labelledby="appearanceSettingsHeading">
+        <h3 id="appearanceSettingsHeading">外观</h3>
+        <div class="thread-field font-size-field">
+          <label class="field-label" for="fontSizeRange">字体大小</label>
+          <input id="fontSizeRange" class="thread-range" type="range" min="11" max="22" step="1" value="13">
+          <output id="fontSizeValue" class="thread-value" for="fontSizeRange">13</output>
+        </div>
+      </section>
+      <section class="settings-section" aria-labelledby="downloadSettingsHeading">
+        <h3 id="downloadSettingsHeading">下载</h3>
+        <label class="field-label" for="dlDirInput">保存目录</label>
+        <div class="path-row">
+          <input id="dlDirInput" class="dirbar-input" type="text" spellcheck="false" placeholder="选择下载目录">
+          <button id="btnBrowseDir" class="btn" type="button">浏览</button>
+        </div>
+        <div class="thread-field">
+          <label class="field-label" for="threadRange">并发线程</label>
+          <input id="threadRange" class="thread-range" type="range" min="8" max="256" step="8" value="256" title="新任务并发连接数">
+          <output id="threadValue" class="thread-value" for="threadRange">256</output>
+        </div>
+      </section>
+      <section class="settings-section" aria-labelledby="installSettingsHeading">
+        <h3 id="installSettingsHeading">MO2</h3>
+        <form id="mo2Settings" class="mo2-settings">
+          <label class="field-label" for="mo2Path">安装目录</label>
+          <div class="mo2-path-row path-row">
+            <input id="mo2Path" class="dirbar-input" type="text" spellcheck="false" value="F:\Skyrim\iniRePather-Skyrim" placeholder="ModOrganizer.exe 所在目录" required>
+            <button id="btnMo2Browse" class="btn" type="button">浏览</button>
+          </div>
+          <div class="mo2-options">
+            <label><input id="mo2Enabled" type="checkbox" checked> 下载后安装到 MO2</label>
+            <label><input id="mo2DeleteArchive" type="checkbox"> 安装成功后删除安装包</label>
+          </div>
+        </form>
+      </section>
+      <section class="settings-section" aria-labelledby="wallpaperSettingsHeading">
+        <h3 id="wallpaperSettingsHeading">背景</h3>
+        <form id="wallpaperSettings">
+          <label class="wallpaper-toggle"><input id="wallpaperEnabled" type="checkbox" checked> 背景图片</label>
+          <label class="field-label" for="wallpaperDir">图片目录</label>
+          <div class="path-row">
+            <input id="wallpaperDir" class="dirbar-input" type="text" spellcheck="false" value="E:\BaiduSyncdisk\壁纸图片" placeholder="选择图片目录">
+            <button id="btnWallpaperBrowse" class="btn" type="button">浏览</button>
+          </div>
+          <div class="thread-field">
+            <label class="field-label" for="wallpaperOpacity">透明度</label>
+            <input id="wallpaperOpacity" class="thread-range" type="range" min="0" max="100" step="1" value="78" title="每 5 分钟随机切换背景">
+            <output id="wallpaperOpacityValue" class="thread-value" for="wallpaperOpacity">78%</output>
+          </div>
+          <p id="wallpaperStatus" class="wallpaper-status hidden" role="status"></p>
+        </form>
+      </section>
+    </div>
+  </dialog>
 
-  <section id="progressBar" class="progress glass hidden">
-    <div class="progress-inner"></div>
-    <span id="progressText"></span>
-  </section>
-
-  <section id="notice" class="notice glass hidden">
-    <span id="noticeText"></span>
-    <button id="noticeClose" class="notice-x hidden" type="button" title="关闭">×</button>
-  </section>
-
-  <main id="modList" class="mod-list"></main>
-
-  <section id="empty" class="empty hidden">
-    <p>暂无数据。点右上角 <b>浏览器登录</b> 或 <b>刷新数据</b> 开始。</p>
-  </section>
-
-  <div id="toasts" class="toasts"></div>
-
-  <script src="static/app.js?v=27"></script>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <script src="static/app.js?v=31"></script>
 </body>
 </html>

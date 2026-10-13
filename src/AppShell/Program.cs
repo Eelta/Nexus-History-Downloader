@@ -29,6 +29,7 @@ internal sealed class MainForm : Form
         Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? "NHD.exe");
         Size = new Size(1280, 820);
         StartPosition = FormStartPosition.CenterScreen;
+        WindowState = FormWindowState.Maximized;
         _web.Dock = DockStyle.Fill;
         Controls.Add(_web);
         FormClosing += (_, _) => StopBackend();

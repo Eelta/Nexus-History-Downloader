@@ -14,6 +14,11 @@ public sealed record TakeoverRequest
     public string? Cookie { get; init; }
     public string? Referrer { get; init; }
     public string? UserAgent { get; init; }
+    /// <summary>Nexus 身份信息用于匹配 MO2 中已有模组；未知时允许为空。</summary>
+    public string? Game { get; init; }
+    public long? ModId { get; init; }
+    public string? FileId { get; init; }
+    public string? ModName { get; init; }
     /// <summary>本次下载的临时目录（可选；未提供时用 settings.json 的默认目录）。</summary>
     public string? SaveDir { get; init; }
     /// <summary>本次任务的并发线程数（可选；未提供时用全局设置/滑块值）。</summary>
@@ -44,6 +49,11 @@ public sealed record JobSnapshot
     public string Url { get; init; } = string.Empty;
     public string Filename { get; init; } = string.Empty;
     public string SavePath { get; init; } = string.Empty;
+    public string? Game { get; init; }
+    public long? ModId { get; init; }
+    public string? FileId { get; init; }
+    public string? ModName { get; init; }
+    public string? Referrer { get; init; }
     public string State { get; init; } = "queued";   // queued|downloading|done|error
     public long Downloaded { get; init; }
     public long? Total { get; init; }

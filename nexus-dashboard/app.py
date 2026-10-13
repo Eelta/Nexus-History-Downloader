@@ -12,11 +12,13 @@ import argparse
 import asyncio
 import json
 import logging
+import ntpath
 import os
 import subprocess
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -25,8 +27,10 @@ from playwright.async_api import async_playwright
 
 import config
 import takeover as takeover_mod
+from mo2 import MO2Manager, atomic_json, read_json
 from scraper import NexusScraper, ProgressTracker
 from session_manager import SessionManager
+from wallpaper import WallpaperManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("nexus.app")
@@ -204,7 +208,37 @@ async def profile_job() -> None:
 
 
 # ------------------------------------------------------------------ fastapi
-app = FastAPI(title="Nexus Mods Download History Dashboard")
+mo2_manager = MO2Manager(config.REPO_ROOT, config.BASE_DIR)
+wallpaper_manager = WallpaperManager(config.REPO_ROOT / "settings.json", mo2_manager.lock)
+
+
+async def _watch_mo2_downloads():
+    while True:
+        try:
+            if not DEMO_MODE:
+                host = await asyncio.to_thread(takeover_mod.host_status)
+                await asyncio.to_thread(mo2_manager.tick, host.get("jobs", []))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("MO2 install monitor: %s", exc)
+        await asyncio.sleep(2)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    watcher = asyncio.create_task(_watch_mo2_downloads())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="Nexus Mods Download History Dashboard", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(config.STATIC_DIR)), name="static")
 
 
@@ -392,6 +426,23 @@ async def takeover_open(request: Request):
 
 # ------------------------------------------------------------- 下载目录设置
 SETTINGS_FILE = config.REPO_ROOT / "settings.json"
+_thread_settings_lock = threading.Lock()
+
+
+def _settings_object() -> dict:
+    data = read_json(SETTINGS_FILE, {})
+    if not isinstance(data, dict):
+        raise ValueError("设置文件无效，原文件已保留")
+    return data
+
+
+def _saved_max_threads() -> int:
+    try:
+        with mo2_manager.lock:
+            value = _settings_object().get("MaxThreads", 256)
+        return value if type(value) is int and 1 <= value <= 4096 else 256
+    except (OSError, ValueError):
+        return 256
 
 
 def _load_download_dir() -> str:
@@ -411,36 +462,177 @@ async def download_dir_get():
     return {"dir": _load_download_dir() or str(config.REPO_ROOT / "cache")}
 
 
+# -------------------------------------------------------------- 界面设置
+def _appearance_settings(body: dict | None = None) -> dict:
+    with mo2_manager.lock:
+        data = _settings_object()
+        appearance = data.get("Appearance", {})
+        if not isinstance(appearance, dict):
+            raise ValueError("界面设置无效，原文件已保留")
+        value = appearance.get("fontSize", 13)
+        if body is not None:
+            if not isinstance(body, dict):
+                raise ValueError("界面设置无效")
+            value = body.get("fontSize", value)
+        if type(value) is not int or not 11 <= value <= 22:
+            raise ValueError("字号需为 11–22 的整数")
+        if body is not None:
+            data["Appearance"] = {**appearance, "fontSize": value}
+            atomic_json(SETTINGS_FILE, data)
+        return {"ok": True, "fontSize": value}
+
+
+@app.get("/api/appearance/settings")
+async def appearance_settings_get():
+    try:
+        return await asyncio.to_thread(_appearance_settings)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.post("/api/appearance/settings")
+async def appearance_settings_set(request: Request):
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("界面设置无效")
+        return await asyncio.to_thread(_appearance_settings, body)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+# -------------------------------------------------------------- 本地背景
+@app.get("/api/wallpaper/settings")
+async def wallpaper_settings_get():
+    try:
+        return await asyncio.to_thread(wallpaper_manager.settings)
+    except (ValueError, OSError):
+        return {"ok": False, "message": "背景设置不可用"}
+
+
+@app.post("/api/wallpaper/settings")
+async def wallpaper_settings_set(request: Request):
+    try:
+        body = await request.json()
+        return await asyncio.to_thread(wallpaper_manager.update_settings, body)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/wallpaper/next")
+async def wallpaper_next(exclude: str = ""):
+    try:
+        return await asyncio.to_thread(wallpaper_manager.next_image, exclude)
+    except (ValueError, OSError):
+        return {"ok": False, "message": "背景不可用"}
+
+
+@app.get("/api/wallpaper/image/{token}")
+async def wallpaper_image(token: str):
+    try:
+        path = await asyncio.to_thread(wallpaper_manager.image_path, token)
+    except (ValueError, OSError):
+        raise HTTPException(404, "图片不可用")
+    return FileResponse(path, headers={"Cache-Control": "no-store",
+                                       "X-Content-Type-Options": "nosniff"})
+
+
+# -------------------------------------------------------------- MO2 安装
+async def _mo2_call(method, *args):
+    try:
+        return await asyncio.to_thread(method, *args)
+    except KeyError:
+        raise HTTPException(404, "安装任务不存在")
+    except (ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/api/mo2/status")
+async def mo2_status():
+    return await _mo2_call(mo2_manager.status)
+
+
+@app.post("/api/mo2/settings")
+async def mo2_settings(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "需要安装设置对象")
+    return await _mo2_call(mo2_manager.update_settings, body)
+
+
+@app.post("/api/mo2/jobs/{job_id}/confirm")
+async def mo2_confirm(job_id: str, request: Request):
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("installName"), str):
+        raise HTTPException(400, "请填写安装名称")
+    return await _mo2_call(mo2_manager.confirm, job_id, body["installName"])
+
+
+@app.post("/api/mo2/jobs/{job_id}/retry")
+async def mo2_retry(job_id: str):
+    return await _mo2_call(mo2_manager.retry, job_id)
+
+
+@app.post("/api/mo2/jobs/{job_id}/skip")
+async def mo2_skip(job_id: str):
+    return await _mo2_call(mo2_manager.skip, job_id)
+
+
 # ------------------------------------------------------------ 并发线程设置
 @app.get("/api/takeover/threads")
 async def takeover_threads_get():
     host = await asyncio.to_thread(takeover_mod.host_status)
     if not host.get("ok"):
-        return {"ok": False, "maxThreads": None, "message": host.get("error", "宿主不可用")}
-    return {"ok": True, "maxThreads": host.get("maxThreads", 64)}
+        return {"ok": False, "applied": False,
+                "maxThreads": await asyncio.to_thread(_saved_max_threads),
+                "message": host.get("error", "宿主不可用")}
+    return {"ok": True, "applied": True, "maxThreads": host.get("maxThreads", 256)}
+
+
+def _apply_max_threads(value: int) -> dict:
+    import urllib.request as _ur
+
+    # Only Python writes settings.json. Serialize host application and persistence
+    # without keeping the shared settings lock held during the HTTP request.
+    with _thread_settings_lock:
+        try:
+            with mo2_manager.lock:
+                _settings_object()
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, f"设置无法读取：{exc}")
+        payload = json.dumps({"maxThreads": value}).encode()
+        req = _ur.Request(takeover_mod.host_base() + "/api/settings", data=payload,
+                          headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with _ur.urlopen(req, timeout=5) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if (not isinstance(result, dict) or result.get("ok") is not True
+                    or type(result.get("maxThreads")) is not int
+                    or result["maxThreads"] != value):
+                raise ValueError("下载服务未确认线程设置")
+        except Exception as exc:
+            raise HTTPException(502, f"线程未确认应用，未保存：{exc}")
+        try:
+            with mo2_manager.lock:
+                data = _settings_object()
+                data["MaxThreads"] = value
+                atomic_json(SETTINGS_FILE, data)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(500, f"线程已应用，但保存失败：{exc}")
+        return {"ok": True, "applied": True, "maxThreads": value}
 
 
 @app.post("/api/takeover/threads")
 async def takeover_threads_set(request: Request):
-    """实时调整宿主并发线程数（对新下载任务生效）。"""
+    """调整新任务并发线程数，并保存供宿主下次启动读取。"""
     try:
         body = await request.json()
-        v = int(body.get("maxThreads") or 0)
+        v = body.get("maxThreads") if isinstance(body, dict) else None
     except Exception:
-        raise HTTPException(400, '需要 JSON: {"maxThreads": 64}')
-    if not 1 <= v <= 4096:
-        raise HTTPException(400, "线程数需在 1~4096")
-    import urllib.request as _ur
-
-    payload = json.dumps({"maxThreads": v}).encode()
-    req = _ur.Request(takeover_mod.host_base() + "/api/settings", data=payload,
-                      headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with _ur.urlopen(req, timeout=5) as r:
-            j = json.loads(r.read().decode("utf-8"))
-    except Exception as exc:
-        raise HTTPException(502, f"宿主不可用：{exc}")
-    return {"ok": j.get("ok", False), "maxThreads": j.get("maxThreads", v)}
+        raise HTTPException(400, '需要 JSON: {"maxThreads": 256}')
+    if type(v) is not int or not 1 <= v <= 4096:
+        raise HTTPException(400, "线程数需为 1~4096 的整数")
+    return await asyncio.to_thread(_apply_max_threads, v)
 
 
 @app.post("/api/takeover/cancel")
@@ -476,20 +668,19 @@ async def download_dir_set(request: Request):
         raise HTTPException(400, '需要 JSON: {"dir": "D:\\\\Downloads"}')
     if not d:
         raise HTTPException(400, "下载目录不能为空")
-    d = d.rstrip("/\\")
-    if not ((len(d) >= 2 and d[1] == ":") or d.startswith("/")):
+    drive, _ = ntpath.splitdrive(d)
+    if drive and ntpath.isabs(d):
+        d = ntpath.normpath(d)
+    elif os.name != "nt" and os.path.isabs(d):
+        d = os.path.normpath(d)
+    else:
         raise HTTPException(400, "请填写绝对路径，例如 D:\\Downloads")
     try:
         config.ensure_dirs()
-        data = {}
-        if SETTINGS_FILE.is_file():
-            try:
-                data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        data["DefaultDownloadDir"] = d
-        SETTINGS_FILE.write_text(
-            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with mo2_manager.lock:
+            data = _settings_object()
+            data["DefaultDownloadDir"] = d
+            atomic_json(SETTINGS_FILE, data)
     except Exception as exc:
         raise HTTPException(500, f"写入失败：{exc}")
     return {"ok": True, "dir": d}
@@ -505,7 +696,7 @@ async def download_choose_dir():
     script = (
         "Add-Type -AssemblyName System.Windows.Forms; "
         "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        "$f.Description = '选择下载目录'; "
+        "$f.Description = '选择文件夹'; "
         "$f.ShowNewFolderButton = $true; "
         "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
         "{ Write-Output $f.SelectedPath }"

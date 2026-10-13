@@ -387,7 +387,8 @@ def test_api_smoke() -> None:
     app_module.load_demo()
     with TestClient(app_module.app) as client:
         r = client.get("/")
-        assert r.status_code == 200 and "Nexus Mods" in r.text, r.status_code
+        assert r.status_code == 200, r.status_code
+        assert 'id="modList"' in r.text and 'id="settingsDialog"' in r.text, "dashboard markup missing"
         s = client.get("/api/status").json()
         assert s["demo"] is True and s["mods_count"] > 0, s
         m = client.get("/api/mods").json()

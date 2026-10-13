@@ -618,7 +618,7 @@ class NexusScraper:
             return None
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-            if data.get("app_version") != config.APP_VERSION:
+            if data.get("app_version") not in config.CACHE_COMPATIBLE_VERSIONS:
                 return None
             if data.get("game") != config.TARGET_GAME:
                 return None
