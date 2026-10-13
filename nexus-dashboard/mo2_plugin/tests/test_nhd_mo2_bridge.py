@@ -112,6 +112,10 @@ class FakeOrganizer:
         self.ui_callback = callback
 
     def pluginSetting(self, plugin, key):
+        # MO2 2.4+ removes the legacy enabled setting during registration.
+        return None
+
+    def isPluginEnabled(self, plugin):
         return self.enabled
 
     def basePath(self):
@@ -220,6 +224,75 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(metadata.read_bytes(), b"[General]\nnotes=keep my notes\n")
         self.assertTrue((self.requests / "one.processing").exists())
         self.assertFalse((self.requests / "one.json").exists())
+
+    def test_mo2_244_reserved_enabled_setting_does_not_disable_bridge(self):
+        self.assertIsNone(self.organizer.pluginSetting(self.plugin.name(), "enabled"))
+        self.assertTrue(self.organizer.isPluginEnabled(self.plugin.name()))
+        self.assertEqual(self.plugin.settings(), [])
+        self.assertEqual(self.plugin.version(), (1, 0, 2))
+        self.enqueue()
+        with patch.object(self.organizer, "pluginSetting", side_effect=AssertionError("reserved setting")):
+            self.plugin._tick()
+        self.assertEqual(self.response()["state"], "installed")
+        self.assertEqual(BRIDGE._read_json(self.queue / "bridge-status.json")["state"], "ready")
+
+    def test_mo2_explicitly_disabled_plugin_has_no_heartbeat_or_claim(self):
+        self.enqueue()
+        self.organizer.enabled = False
+        self.plugin._tick()
+        self.assertEqual(self.organizer.calls, [])
+        self.assertFalse((self.queue / "bridge-status.json").exists())
+        self.assertTrue((self.requests / "one.json").exists())
+
+    def test_display_connects_and_counts_pending_without_installing_or_recovering(self):
+        self.enqueue("waiting")
+        self.enqueue("interrupted")
+        (self.requests / "interrupted.json").rename(self.requests / "interrupted.processing")
+        self.enqueue("completed")
+        BRIDGE._atomic_json(self.queue / "responses" / "completed.json", {"state": "installed"})
+        self.plugin._last_error = "stale connection error"
+        with patch.object(BRIDGE.QMessageBox, "information") as information:
+            self.plugin.display()
+        self.assertEqual(information.call_args.args[2], "已连接 · 待安装 1\n\n关闭此窗口后自动安装")
+        self.assertIsNone(self.plugin._last_error)
+        self.assertEqual(self.organizer.calls, [])
+        self.assertTrue((self.requests / "waiting.json").exists())
+        self.assertFalse((self.queue / "responses" / "interrupted.json").exists())
+        self.assertTrue(self.plugin._needs_recovery)
+        self.assertEqual(BRIDGE._read_json(self.queue / "bridge-status.json")["state"], "ready")
+        self.plugin._tick()
+        self.assertEqual(self.response("interrupted")["state"], "error")
+        self.assertEqual(self.response("waiting")["state"], "installed")
+
+    def test_display_with_empty_queue_asks_for_name_confirmation(self):
+        with patch.object(BRIDGE.QMessageBox, "information") as information:
+            self.plugin.display()
+        self.assertEqual(information.call_args.args[2], "已连接 · 待安装 0\n\n请在下载器确认安装名称")
+        self.assertEqual(self.organizer.calls, [])
+
+    def test_display_disabled_does_not_connect_or_claim(self):
+        self.enqueue()
+        self.organizer.enabled = False
+        with patch.object(BRIDGE.QMessageBox, "information") as information:
+            self.plugin.display()
+        self.assertEqual(information.call_args.args[2], "已停用")
+        self.assertIsNone(self.plugin._queue)
+        self.assertFalse((self.queue / "bridge-status.json").exists())
+        self.assertTrue((self.requests / "one.json").exists())
+        self.assertEqual(self.organizer.calls, [])
+
+    def test_display_connection_failure_then_recovery_clears_error(self):
+        self.config.unlink()
+        with patch.object(BRIDGE.QMessageBox, "information") as information:
+            self.plugin.display()
+        self.assertTrue(information.call_args.args[2].startswith("连接失败\n\n"))
+        self.assertIsNotNone(self.plugin._last_error)
+        self.assertEqual(self.organizer.calls, [])
+        BRIDGE._atomic_json(self.config, {"queue_dir": str(self.queue)})
+        with patch.object(BRIDGE.QMessageBox, "information") as information:
+            self.plugin.display()
+        self.assertTrue(information.call_args.args[2].startswith("已连接"))
+        self.assertIsNone(self.plugin._last_error)
 
     def test_native_user_rename_is_reported(self):
         self.enqueue()

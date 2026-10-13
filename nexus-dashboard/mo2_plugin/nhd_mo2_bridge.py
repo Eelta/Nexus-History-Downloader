@@ -101,15 +101,17 @@ class NHDMO2Bridge(mobase.IPluginTool):
         return "Install confirmed Nexus History Downloader archives using MO2's own installers."
 
     def version(self):
-        return mobase.VersionInfo(1, 0, 1)
+        return mobase.VersionInfo(1, 0, 2)
 
     def isActive(self):
         return self._organizer is not None and bool(
-            self._organizer.pluginSetting(self.name(), "enabled")
+            self._organizer.isPluginEnabled(self.name())
         )
 
     def settings(self):
-        return [mobase.PluginSetting("enabled", "Accept confirmed downloader installations", True)]
+        # MO2 2.4+ owns enabled state; an "enabled" PluginSetting is migrated
+        # out of pluginSetting() and therefore reads back as None.
+        return []
 
     def displayName(self):
         return "Nexus History Downloader 安装桥接"
@@ -125,9 +127,31 @@ class NHDMO2Bridge(mobase.IPluginTool):
         self._parent_widget = widget
 
     def display(self):
-        status = "正在安装；请完成 MO2 的安装选项。" if self._busy else "等待下载器中已确认名称的安装任务。"
-        detail = self._last_error or (str(self._queue) if self._queue else "尚未连接；请在下载器设置中配置 MO2 桥接。")
-        QMessageBox.information(self._window, self.displayName(), status + "\n\n" + detail)
+        try:
+            if not self.isActive():
+                message = "已停用"
+            else:
+                # Opening this status dialog never claims a request or invokes
+                # an installer. Recovery is left for the normal timer tick.
+                if not self._busy:
+                    self._configure_queue(recover=False)
+                self._heartbeat()
+                self._last_error = None
+                pending = sum(
+                    1 for path in (self._queue / "requests").glob("*.json")
+                    if REQUEST_ID.fullmatch(path.stem)
+                    and not path.with_suffix(".processing").exists()
+                    and not (self._queue / "responses" / path.name).exists()
+                )
+                status = "正在安装" if self._busy else "已连接"
+                detail = ("请完成 MO2 的安装选项" if self._busy else
+                          "关闭此窗口后自动安装" if pending else
+                          "请在下载器确认安装名称")
+                message = "{} · 待安装 {}\n\n{}".format(status, pending, detail)
+        except Exception as error:
+            self._report_error(error)
+            message = "连接失败\n\n" + self._last_error
+        QMessageBox.information(self._window, self.displayName(), message)
 
     def _ui_ready(self, window):
         self._window = window
@@ -145,14 +169,14 @@ class NHDMO2Bridge(mobase.IPluginTool):
             LOG.warning("%s", message)
         self._last_error = message
 
-    def _configure_queue(self):
+    def _configure_queue(self, recover=True):
         config = _read_json(self._config_path)
         configured = config.get("queue_dir")
         if not isinstance(configured, str) or not Path(configured).is_absolute():
             raise ValueError("nhd_bridge.json queue_dir must be an absolute path")
         queue = Path(configured).resolve()
         if self._queue == queue and self._queue_lock is not None:
-            if self._needs_recovery:
+            if recover and self._needs_recovery:
                 self._recover_interrupted()
                 self._needs_recovery = False
             return True
@@ -170,8 +194,9 @@ class NHDMO2Bridge(mobase.IPluginTool):
         self._needs_recovery = True
         (queue / "requests").mkdir(exist_ok=True)
         (queue / "responses").mkdir(exist_ok=True)
-        self._recover_interrupted()
-        self._needs_recovery = False
+        if recover:
+            self._recover_interrupted()
+            self._needs_recovery = False
         return True
 
     def _recover_interrupted(self):
@@ -287,6 +312,7 @@ class NHDMO2Bridge(mobase.IPluginTool):
             self._flush_response()
             self._configure_queue()
             self._heartbeat()
+            self._last_error = None
             if not self._window.isEnabled() or QApplication.activeModalWidget() is not None:
                 return
             for request_path in sorted((self._queue / "requests").glob("*.json")):
