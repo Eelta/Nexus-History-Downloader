@@ -987,7 +987,6 @@ const mo2State = {
   rows: new Map(),
   busy: new Set(),
   jobs: [],
-  jobsLoaded: false,
   bridge: { state: "unavailable", message: "" },
 };
 
@@ -1077,8 +1076,9 @@ async function refreshMo2Status() {
 }
 
 function startMo2Watcher() {
-  refreshMo2Status();
+  const initialStatus = refreshMo2Status();
   if (!mo2State.timer && !PREVIEW_MODE) mo2State.timer = setInterval(refreshMo2Status, 2000);
+  return initialStatus;
 }
 
 
@@ -1093,7 +1093,6 @@ function renderMo2Jobs() {
   let awaiting = 0;
   let installed = 0;
   let skipped = 0;
-  let revealHistory = false;
   for (const job of jobs) {
     const id = String(job.id);
     const completed = job.state === "installed" || job.state === "cancelled";
@@ -1107,7 +1106,6 @@ function renderMo2Jobs() {
     const signature = JSON.stringify([job, connectionState]);
     const record = mo2State.rows.get(id);
     if (record && (record.signature === signature || mo2State.busy.has(id))) continue;
-    if (job.state === "installed" && ((record ? record.state !== "installed" : mo2State.jobsLoaded) || (job.cleanupError && !record?.cleanupError))) revealHistory = true;
     const oldInput = record && record.row.querySelector(".mo2-name-input");
     const selection = oldInput && document.activeElement === oldInput
       ? [oldInput.selectionStart, oldInput.selectionEnd, oldInput.selectionDirection] : null;
@@ -1116,7 +1114,7 @@ function renderMo2Jobs() {
     if (detailsOpen && row.querySelector(".mo2-job-details")) row.querySelector(".mo2-job-details").open = true;
     if (record && record.row.parentElement === parent) record.row.replaceWith(row);
     else { if (record) record.row.remove(); parent.appendChild(row); }
-    mo2State.rows.set(id, { row, signature, state: job.state, cleanupError: job.cleanupError });
+    mo2State.rows.set(id, { row, signature });
     const newInput = selection && row.querySelector(".mo2-name-input");
     if (newInput) {
       newInput.focus({ preventScroll: true });
@@ -1126,9 +1124,7 @@ function renderMo2Jobs() {
   $("mo2Empty").classList.toggle("hidden", active > 0);
   $("mo2History").classList.toggle("hidden", !history);
   $("mo2HistorySummary").textContent = `已安装 ${installed} · 已跳过 ${skipped}`;
-  if (revealHistory) $("mo2History").open = true;
   $("mo2JobCount").textContent = awaiting ? `${awaiting} 待确认` : (active ? String(active) : "");
-  mo2State.jobsLoaded = true;
 }
 
 function buildMo2Job(job) {
@@ -1700,19 +1696,35 @@ function wireEvents() {
 }
 
 /* ------------------------------------------------------------------- boot */
+function reportStartup(stage, message) {
+  // WebView2 原生启动画面；普通浏览器与静态预览无需宿主。
+  try {
+    window.chrome?.webview?.postMessage({ type: "nhd-startup", stage, ...(message ? { message } : {}) });
+  } catch { /* 宿主通知失败不影响页面自身启动。 */ }
+}
+
 async function boot() {
+  reportStartup("page-started");
   if (PREVIEW_MODE) document.body.classList.add("preview");
   loadDlMarks();           // 恢复本地“已下载”实时标记（必须在首次渲染之前）
   wireEvents();
-  startMo2Watcher();
-  loadWallpaperSettings();
-  loadAppearance();
+  await Promise.all([
+    startMo2Watcher(),
+    loadWallpaperSettings(),
+    loadAppearance(),
+    loadDir(),
+    loadThreads(),
+  ]);
+  reportStartup("settings-ready");
   await refreshStatus(true);
-  await loadMods(true);
+  await loadMods();
   await loadDiscarded();
-  await loadDir();
-  await loadThreads();
+  reportStartup("library-ready");
   if (!PREVIEW_MODE) startDlWatcher();   // 实时下载进度 + 失败提示
+
+  // 两帧之间让浏览器先完成布局与绘制，再通知宿主淡出启动画面。
+  await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  reportStartup("ready");
 
   // 每次启动自动强制刷新（爬取很快，不等待缓存 TTL）
   try {
@@ -1727,4 +1739,5 @@ async function boot() {
 
 boot().catch((e) => {
   setNotice("初始化失败: " + e.message);
+  reportStartup("error", e.message || String(e));
 });

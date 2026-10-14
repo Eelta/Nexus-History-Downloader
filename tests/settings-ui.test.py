@@ -80,6 +80,17 @@ threading.Thread(target=server.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{server.server_port}"
 persisted_appearance = {"fontSize": 13}
 persisted_mo2 = {}
+STARTUP_CAPTURE = """(() => {
+  window.__qaStartup = [];
+  let frame = 0;
+  const countFrame = () => { frame++; requestAnimationFrame(countFrame); };
+  requestAnimationFrame(countFrame);
+  window.chrome = window.chrome || {};
+  window.chrome.webview = {postMessage: message => window.__qaStartup.push({
+    ...message, frame, mods: document.querySelectorAll('.mod-card').length,
+    mo2: document.querySelectorAll('.mo2-job').length
+  })};
+})();"""
 
 try:
     with sync_playwright() as playwright:
@@ -96,6 +107,7 @@ try:
                 route.abort()
         context.route("**/*", restrict)
         page = context.new_page()
+        page.add_init_script(STARTUP_CAPTURE)
         page.on("pageerror", lambda error: REPORT["errors"].append(str(error)))
         page.route(BASE + "/?preview=1", lambda route: route.fulfill(path=str(ROOT / "nexus-dashboard/static/index.html"), content_type="text/html"))
         def preview_script(route):
@@ -110,6 +122,13 @@ try:
         page.goto(BASE + "/?preview=1")
         page.wait_for_function('document.querySelectorAll(".mod-card").length === 5 && !!document.querySelector(".mo2-name-input")')
         assert page.evaluate("PREVIEW_MODE") is True
+        page.wait_for_function("__qaStartup.some(message => message.stage === 'ready')")
+        startup = page.evaluate('__qaStartup')
+        assert [message['stage'] for message in startup] == ['page-started', 'settings-ready', 'library-ready', 'ready'], startup
+        assert all(message['type'] == 'nhd-startup' for message in startup), startup
+        assert startup[-1]['frame'] >= startup[-2]['frame'] + 2, startup
+        assert startup[-1]['mods'] == 5 and startup[-1]['mo2'] > 0, startup
+        passed('Native startup milestones arrive in order; ready follows the rendered library by two animation frames')
         page.evaluate("document.body.classList.remove('preview')")
         page.evaluate("""() => {
           window.__qaRequests = []; window.__qaActivePosts = 0; window.__qaMaxPosts = 0;
@@ -430,15 +449,19 @@ try:
           mo2Preview.jobs[0].installedName = '玩家自定模组名称';
           return refreshMo2Status();
         }""")
-        assert page.locator('#mo2History').evaluate('el => el.open')
+        assert not page.locator('#mo2History').evaluate('el => el.open')
         assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 0'
         assert page.locator('#mo2HistoryJobs .mo2-job').count() == 1
+        page.locator('#mo2HistorySummary').click()
+        assert page.locator('#mo2History').evaluate('el => el.open')
+        page.evaluate('refreshMo2Status()')
+        assert page.locator('#mo2History').evaluate('el => el.open')
         page.locator('#mo2HistorySummary').click()
         assert not page.locator('#mo2History').evaluate('el => el.open')
         page.evaluate('refreshMo2Status()')
         page.evaluate('refreshMo2Status()')
         assert not page.locator('#mo2History').evaluate('el => el.open')
-        passed('Queued-to-installed transition expands history once; manual collapse survives repeated polling')
+        passed('Installation keeps history collapsed; manual expansion and collapse survive polling')
 
         page.evaluate("""() => {
           mo2Preview.jobs.push({id:'qa-cancelled', state:'cancelled', filename:'Cancelled-fixture.zip'});
@@ -450,12 +473,14 @@ try:
         passed('Cancelled jobs count as skipped separately from installed mods')
 
         page.evaluate("mo2Preview.jobs[0].cleanupError = 'fixture archive locked'; refreshMo2Status()")
+        assert not page.locator('#mo2History').evaluate('el => el.open')
+        page.locator('#mo2HistorySummary').click()
         assert page.locator('#mo2History').evaluate('el => el.open')
         assert page.evaluate("mo2State.rows.get('preview-mo2').row.querySelector('.mo2-job-heading .chip').textContent") == '已安装'
         assert page.evaluate("mo2State.rows.get('preview-mo2').row.parentElement.id") == 'mo2HistoryJobs'
         assert page.get_by_text('清理失败：fixture archive locked', exact=True).is_visible()
         assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 1'
-        passed('Archive cleanup failure remains visibly installed and exposes the cleanup error in history')
+        passed('Archive cleanup failure keeps history collapsed and is visible after manual expansion')
 
         # A fresh job should select its highest candidate, but still wait for Install.
         page.evaluate("""() => {
@@ -574,6 +599,34 @@ try:
         page.wait_for_function("document.querySelector('#mo2HistoryRetention').value === '0'")
         assert page.evaluate('mo2Preview.settings.historyRetentionDays') == 0
         passed('Reload restores the saved keep-history choice without replacing zero with the default')
+
+        # No native bridge is required; initialization failures still tell the host and user.
+        ordinary = context.new_page()
+        ordinary.on('pageerror', lambda error: REPORT['errors'].append(str(error)))
+        ordinary.route(BASE + '/?preview=1', lambda route: route.fulfill(path=str(ROOT / 'nexus-dashboard/static/index.html'), content_type='text/html'))
+        ordinary.goto(BASE + '/?preview=1')
+        ordinary.wait_for_function("document.querySelectorAll('.mod-card').length === 5 && !!document.querySelector('.mo2-name-input')")
+        assert ordinary.evaluate('typeof window.chrome?.webview') == 'undefined'
+        ordinary.close()
+        passed('Static preview also initializes normally in an ordinary browser without the WebView2 bridge')
+
+        failed = context.new_page()
+        failed.add_init_script(STARTUP_CAPTURE)
+        failed.on('pageerror', lambda error: REPORT['errors'].append(str(error)))
+        failed.route(BASE + '/?preview=1', lambda route: route.fulfill(path=str(ROOT / 'nexus-dashboard/static/index.html'), content_type='text/html'))
+        def failing_script(route):
+            source = (ROOT / 'nexus-dashboard/static/app.js').read_text(encoding='utf-8')
+            source = source.replace('boot().catch', 'wireEvents = () => { throw new Error("QA startup failure"); };\nboot().catch')
+            route.fulfill(body=source, content_type='application/javascript')
+        failed.route(BASE + '/static/app.js*', failing_script)
+        failed.goto(BASE + '/?preview=1')
+        failed.wait_for_function("__qaStartup.some(message => message.stage === 'error')")
+        failure = failed.evaluate('__qaStartup')
+        assert [message['stage'] for message in failure] == ['page-started', 'error'], failure
+        assert failure[-1]['message'] == 'QA startup failure'
+        assert failed.locator('#noticeText').inner_text() == '初始化失败: QA startup failure'
+        failed.close()
+        passed('Initialization failures report error to the host and retain the existing visible failure notice')
         assert not REPORT['errors'], REPORT['errors']
         assert not REPORT['blocked_requests'], REPORT['blocked_requests']
         passed('No JavaScript errors, external requests or live backend mutations')

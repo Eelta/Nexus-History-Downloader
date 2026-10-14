@@ -44,10 +44,10 @@ HISTORY_URL = "https://www.nexusmods.com/users/myaccount?tab=download+history"
 LOGIN_URL = "https://users.nexusmods.com/login"
 
 # bump on each code change so the dashboard footer shows the running version
-APP_VERSION = "2.43"
+APP_VERSION = "2.44"
 # MO2 and appearance updates do not change the history/file cache schema.
 # Keep existing archives usable across these upgrades.
-CACHE_COMPATIBLE_VERSIONS = {"2.36", "2.37", "2.38", "2.39", "2.40", "2.41", "2.42", APP_VERSION}
+CACHE_COMPATIBLE_VERSIONS = {"2.36", "2.37", "2.38", "2.39", "2.40", "2.41", "2.42", "2.43", APP_VERSION}
 
 # --- collection behaviour ---------------------------------------------------
 DEFAULT_MAX_HISTORY = None    # None = 抓取全部下载历史（不限制条数），再由
