@@ -175,6 +175,18 @@ class RefreshLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertEqual(self.scan_forces, [True])
 
+    async def test_retry_clears_old_error_before_scan_finishes(self):
+        self.state.refresh_error = "Previous history page timed out"
+        self.scan_release[0].clear()
+        await self.dashboard.refresh(force=True)
+        self.assertIsNone(self.state.refresh_error)
+        await asyncio.wait_for(self.scan_started[0].wait(), 1)
+        self.assertIsNone(self.state.refresh_error)
+        self.assert_previous_results_preserved()
+        self.scan_release[0].set()
+        await self.settle()
+        self.assertEqual(self.state.refresh_version, 8)
+
     async def test_refresh_during_login_waits_and_merges_requests(self):
         await self.dashboard.auth_profile()
         await asyncio.wait_for(self.login_started.wait(), 1)

@@ -28,6 +28,8 @@ class Page:
         self.goto = AsyncMock(side_effect=self.navigate)
         self.reload = AsyncMock()
         self.wait_for_timeout = AsyncMock()
+        self.wait_for_load_state = AsyncMock()
+        self.bring_to_front = AsyncMock()
         self.close = AsyncMock()
 
     async def navigate(self, url, **kwargs):
@@ -40,11 +42,12 @@ class Page:
         return self.states.pop(0) if len(self.states) > 1 else self.states[0]
 
 
-def context(page=None, cookies=None):
+def context(page=None, cookies=None, origins=None):
     page = page or Page()
     return types.SimpleNamespace(
         pages=[page], new_page=AsyncMock(return_value=page),
         cookies=AsyncMock(return_value=cookies or []),
+        storage_state=AsyncMock(return_value={"cookies": cookies or [], "origins": origins or []}),
     )
 
 
@@ -220,13 +223,47 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_unrelated_tab_does_not_confirm_nexus_login(self):
         self.assertFalse(await self.manager._logged_in_anywhere(context(Page([READY], "https://nexusmods.com.example.org"))))
 
+    async def test_existing_login_or_challenge_tab_is_reused_without_navigation(self):
+        for state in (FORM, {**LOADING, "challenge": True}, READY):
+            nexus = Page([state])
+            browser_context = context()
+            browser_context.pages = [Page(url="about:blank"), nexus]
+            self.assertIs(await self.manager._open_login_page(browser_context), nexus)
+            browser_context.new_page.assert_not_awaited()
+            nexus.goto.assert_not_awaited()
+            nexus.reload.assert_not_awaited()
+            nexus.bring_to_front.assert_awaited_once()
+
+    async def test_navigation_timeout_keeps_committed_challenge_in_same_tab(self):
+        page = Page([{**LOADING, "challenge": True}], url="about:blank")
+        async def committed_challenge(url, **kwargs):
+            page.url = url
+            raise TimeoutError("challenge arrived but navigation timed out")
+        page.goto.side_effect = committed_challenge
+        browser_context = context(page)
+        self.assertIs(await self.manager._open_login_page(browser_context), page)
+        page.goto.assert_awaited_once()
+        page.reload.assert_not_awaited()
+        browser_context.new_page.assert_not_awaited()
+
+    async def test_stuck_blank_tab_retries_same_tab_and_keeps_unrelated_tabs(self):
+        page = Page(url="about:blank")
+        page.goto.side_effect = [TimeoutError(), None]
+        browser_context = context(page)
+        browser_context.pages.insert(0, Page(url="https://example.org"))
+        self.assertIs(await self.manager._open_login_page(browser_context), page)
+        self.assertEqual(page.goto.await_count, 2)
+        browser_context.new_page.assert_not_awaited()
+        for existing in browser_context.pages:
+            existing.close.assert_not_awaited()
+
     async def test_unfinished_login_does_not_overwrite_saved_session(self):
         original = self.originals()
         browser_context = context(Page([FORM]))
         with self.assertRaises(RuntimeError):
             await self.manager._save_session_from_context(browser_context, "fixture", "fixture", "chrome")
         self.assertEqual(self.originals(), original)
-        browser_context.cookies.assert_not_awaited()
+        browser_context.storage_state.assert_not_awaited()
 
     async def test_empty_foreign_or_expired_cookies_do_not_replace_saved_session(self):
         original = self.originals()
@@ -234,8 +271,6 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             {"name": "sid_fixture", "value": "fixture", "domain": "nexusmods.com.example.org"},
         ], [
             {"name": "sid_fixture", "value": "fixture", "domain": ".nexusmods.com", "expires": 1},
-        ], [
-            {"name": "consent", "value": "fixture", "domain": ".nexusmods.com"},
         ]):
             with self.subTest(cookies=len(cookies)), self.assertRaises(RuntimeError):
                 await self.manager._save_session_from_context(context(cookies=cookies), "fixture", "fixture", "chrome")
@@ -244,9 +279,38 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_cookie_read_failure_does_not_replace_saved_session(self):
         original = self.originals()
         browser_context = context()
-        browser_context.cookies.side_effect = RuntimeError("fixture read failure")
+        browser_context.storage_state.side_effect = RuntimeError("fixture read failure")
         with self.assertRaises(RuntimeError):
             await self.manager._save_session_from_context(browser_context, "fixture", "fixture", "chrome")
+        self.assertEqual(self.originals(), original)
+
+    async def test_changed_cookie_name_and_path_scoped_auth_are_saved(self):
+        cookie = {"name": "nexus_session_v2", "value": "fixture", "domain": "users.nexusmods.com", "path": "/auth", "expires": -1}
+        browser_context = context(cookies=[cookie])
+        self.assertEqual(await self.manager._save_session_from_context(browser_context, "fixture", "fixture"), 1)
+        self.assertEqual(json.loads(self.session.read_text())["cookies"], [cookie])
+        browser_context.cookies.assert_not_awaited()
+        browser_context.storage_state.assert_awaited_once_with()
+
+    async def test_nexus_local_storage_is_restorable_and_foreign_storage_is_excluded(self):
+        nexus = {"origin": "https://next.nexusmods.com", "localStorage": [{"name": "session", "value": "fixture"}]}
+        foreign = {"origin": "https://nexusmods.com.example.org", "localStorage": [{"name": "secret", "value": "fixture"}]}
+        browser_context = context(origins=[nexus, foreign])
+        self.assertEqual(await self.manager._save_session_from_context(browser_context, "fixture", "fixture"), 0)
+        self.assertEqual(json.loads(self.session.read_text()), {"cookies": [], "origins": [nexus]})
+
+    async def test_foreign_storage_alone_does_not_replace_session(self):
+        original = self.originals()
+        browser_context = context(origins=[{"origin": "https://example.org", "localStorage": [{"name": "session", "value": "fixture"}]}])
+        with self.assertRaises(RuntimeError):
+            await self.manager._save_session_from_context(browser_context, "fixture", "fixture")
+        self.assertEqual(self.originals(), original)
+
+    async def test_redirect_during_storage_read_preserves_saved_session(self):
+        original = self.originals()
+        browser_context = context(Page([READY, FORM]), cookies=[{"name": "session", "value": "fixture", "domain": ".nexusmods.com"}])
+        with self.assertRaisesRegex(RuntimeError, "登录尚未完成"):
+            await self.manager._save_session_from_context(browser_context, "fixture", "fixture")
         self.assertEqual(self.originals(), original)
 
     async def test_save_uses_instance_path_filters_domains_and_preserves_channel(self):
@@ -287,8 +351,9 @@ function check({form=false,loading=false,title='',body='An authenticated Nexus p
     getComputedStyle:()=>({visibility:'visible'})
   });
 }
-const results = [check(),check({form:true}),check({loading:true}),check({title:'Just a moment'}),check({body:''}),check({state:'loading'}),check({link:false})];
-if (results.map(x=>x.ok).join() !== 'true,false,false,false,false,false,false') process.exit(1);
+const results = [check(),check({form:true}),check({loading:true}),check({title:'Just a moment'}),check({body:''}),check({state:'loading'}),check({link:false}),check({title:'Performing security verification'}),check({body:'This page is displayed while the website verifies you are not a bot.'})];
+if (results.map(x=>x.ok).join() !== 'true,false,false,false,false,false,false,false,false') process.exit(1);
+if (!results[7].challenge || !results[8].challenge) process.exit(2);
 """
         subprocess.run([shutil.which("node"), "-e", fixture], input=sessions.IS_LOGGED_IN_JS,
                        text=True, capture_output=True, check=True, timeout=10,

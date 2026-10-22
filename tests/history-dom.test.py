@@ -65,6 +65,9 @@ async def main():
 
             await page.set_content("<title>Just a moment</title><p>Verify you are human</p>")
             assert (await page.evaluate(HISTORY_STATE_JS))["state"] == "challenge"
+            await page.set_content("<title>www.nexusmods.com</title><h1>Performing security verification</h1>"
+                                   "<p>This page is displayed while the website verifies you are not a bot.</p>")
+            assert (await page.evaluate(HISTORY_STATE_JS))["state"] == "challenge"
             await page.set_content('<input type="password"><p>Sign in</p>')
             assert (await page.evaluate(HISTORY_STATE_JS))["state"] == "login"
             print("PASS real DOM: verification and login forms are distinct", flush=True)

@@ -20,8 +20,8 @@ HISTORY_STATE_JS = r"""
     /\/auth\/sign_in|\/login/.test(location.pathname);
   if (login || Array.from(document.querySelectorAll('input[type=password]')).some(visible))
     return {state:'login'};
-  if (/just a moment|checking your browser/i.test(document.title) ||
-      /verify you are human|sorry, you have been blocked/i.test(text))
+  if (/just a moment|checking your browser|performing security verification/i.test(document.title) ||
+      /performing security verification|website verifies you are not a bot|verify (?:that )?you are human|verifying you are human|sorry, you have been blocked/i.test(text))
     return {state:'challenge'};
   const table = document.querySelector('table.datatable, #DataTables_Table_0') ||
     Array.from(document.querySelectorAll('table')).find(t => /last\s*dl/i.test(t.innerText));

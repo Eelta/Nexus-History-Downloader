@@ -68,7 +68,7 @@ IS_LOGGED_IN_JS = r"""
   const hasLoginForm = Array.from(document.querySelectorAll('input[type=password]')).some(visible);
   const hasUserInput = !!document.activeElement?.matches('input:not([type=hidden]), textarea, [contenteditable=true]');
   const text = document.body ? document.body.innerText.trim() : '';
-  const challenge = /just a moment|checking your browser|verify (?:that )?you are human|sorry, you have been blocked/i.test(document.title + ' ' + text.slice(0, 2000));
+  const challenge = /just a moment|checking your browser|performing security verification|website verifies you are not a bot|verify (?:that )?you are human|verifying you are human|sorry, you have been blocked/i.test(document.title + ' ' + text.slice(0, 2000));
   const loading = visible(document.querySelector('#history_loading'));
   const ready = document.readyState !== 'loading' && text.length > 40 && !challenge && !loading;
   return { ok: ready && hasAccountLink && !hasLoginForm, hasLoginForm, hasUserInput, ready, challenge };
@@ -324,6 +324,30 @@ class SessionManager:
             log.warning("profile link creation failed: %s", exc)
             return None
 
+    async def _open_login_page(self, context):
+        """Reuse a Nexus tab, leaving an in-progress login/challenge untouched."""
+        page = next((p for p in context.pages if _is_nexus_url(p.url or "")), None)
+        if page is None:
+            page = next((p for p in context.pages if p.url == "about:blank"), None)
+            if page is None:
+                page = await context.new_page()
+            for attempt in range(2):
+                try:
+                    await page.goto(config.SITE, wait_until="commit", timeout=30_000)
+                    await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                except Exception as exc:
+                    log.warning("login navigation attempt %d failed: %s",
+                                attempt + 1, type(exc).__name__)
+                # A timeout may leave a useful login or challenge document.
+                # Wait there for the user instead of opening another tab.
+                if _is_nexus_url(page.url or "") or page.is_closed():
+                    break
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return page
+
     async def login_with_real_profile(self, playwright,
                                       max_wait_minutes: int = 8) -> int | None:
         """One-click automation: open the user's OWN Edge/Chrome profile.
@@ -331,7 +355,7 @@ class SessionManager:
         The profile already carries the real cookies / Cloudflare clearance
         / UA, so the login window looks and behaves like their normal
         browser.  If they are already logged in, zero manual steps happen.
-        After the session is confirmed, ONLY nexus-domain cookies + UA are
+        After the session is confirmed, ONLY Nexus cookies/localStorage + UA are
         persisted (privacy: no other site cookies, no passwords), then the
         profile is released and later runs reuse the saved session.
 
@@ -374,71 +398,8 @@ class SessionManager:
         await self._harden(context)
         log.info("profile context opened, pages=%d", len(context.pages))
         try:
-            # use the VISIBLE first tab; if the browser hijacks it (welcome /
-            # newtab / session-restore), retry on a fresh tab below
-            page = context.pages[0] if context.pages else await context.new_page()
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
-
-            def on_nexus(p) -> bool:
-                try:
-                    return _is_nexus_url(p.url or "")
-                except Exception:
-                    return False
-
-            try:
-                await page.goto(config.SITE, wait_until="commit",
-                                timeout=30_000)
-                await page.wait_for_load_state("domcontentloaded",
-                                               timeout=30_000)
-            except Exception as exc:
-                log.warning("first tab goto failed: %s", exc)
+            page = await self._open_login_page(context)
             await page.wait_for_timeout(2500)
-
-            # Edge/Chrome sometimes keep the very first tab stuck on
-            # about:blank / newtab - open a fresh tab and navigate there
-            if not on_nexus(page):
-                log.info("first tab stuck on %s - retrying on a new tab",
-                         _safe_url(page.url or "about:blank"))
-                try:
-                    page2 = await context.new_page()
-                    await page2.goto(config.SITE,
-                                     wait_until="domcontentloaded",
-                                     timeout=45_000)
-                    page = page2
-                    for p in list(context.pages):
-                        if p is not page and str(p.url or "").startswith("about:"):
-                            try:
-                                await p.close()
-                            except Exception:
-                                pass
-                except Exception as exc:
-                    # Navigation failed: do NOT abort - keep the window open
-                    # and let the user open nexusmods.com manually.  Login
-                    # detection scans ALL tabs + cookies, so a manual login
-                    # is still recognized.  Save a diagnostic screenshot.
-                    shot = None
-                    try:
-                        shot = config.CACHE_DIR / "login-debug.png"
-                        await page.screenshot(path=str(shot))
-                    except Exception:
-                        pass
-                    log.warning(
-                        "new-tab navigation failed (%s); waiting for manual "
-                        "login instead%s",
-                        exc, f" (screenshot saved: {shot})" if shot else "",
-                    )
-                await page.wait_for_timeout(2500)
-
-            if not on_nexus(page):
-                try:
-                    await page.reload(wait_until="domcontentloaded",
-                                      timeout=30_000)
-                    await page.wait_for_timeout(2000)
-                except Exception as exc:
-                    log.warning("reload after stuck tab failed: %s", exc)
             log.info("real-profile window url=%s", _safe_url(page.url))
 
             async def logged_in_anywhere() -> bool:
@@ -523,27 +484,20 @@ class SessionManager:
 
     async def _save_session_from_context(self, context, ua: str,
                                          source: str, browser_channel: str | None = None) -> int:
-        """Persist ONLY nexus-related cookies (privacy-first).
+        """Persist ONLY Nexus cookies and localStorage after DOM confirmation.
 
         Returns the number of persisted cookies."""
         if not await self._logged_in_anywhere(context):
             raise RuntimeError("N 网登录尚未完成，原登录信息已保留。")
-        nexus_domains = [
-            "https://www.nexusmods.com",
-            "https://users.nexusmods.com",
-            "https://next.nexusmods.com",
-            "https://api.nexusmods.com",
-            "https://forums.nexusmods.com",
-        ]
-        cookies: list[dict] = []
-        for d in nexus_domains:
-            try:
-                cookies += await context.cookies(d)
-            except Exception as exc:
-                raise RuntimeError("读取 N 网登录信息失败，原登录信息已保留。") from exc
+        try:
+            # URL-filtered cookies only include cookies matching that URL's
+            # path; querying the homepage drops /users or /auth cookies.
+            state = await context.storage_state()
+        except Exception as exc:
+            raise RuntimeError("读取 N 网登录信息失败，原登录信息已保留。") from exc
         now = time.time()
         valid = []
-        for cookie in cookies:
+        for cookie in state.get("cookies", []):
             domain = str(cookie.get("domain") or "").lstrip(".").lower()
             expires = cookie.get("expires", -1)
             if (domain != "nexusmods.com" and not domain.endswith(".nexusmods.com")):
@@ -553,12 +507,20 @@ class SessionManager:
             if type(expires) in (int, float) and expires >= 0 and expires <= now:
                 continue
             valid.append(cookie)
-        dedup = {(c.get("domain"), c.get("path", "/"), c.get("name")): c for c in valid}
+        dedup = {(c.get("domain"), c.get("path", "/"), c.get("name"), c.get("partitionKey")): c for c in valid}
         cookies = list(dedup.values())
-        if not any(relevant in str(cookie["name"]).lower()
-                   for cookie in cookies for relevant in ("sid_", "jwt", "access_token")):
+        origins = [{"origin": origin["origin"], "localStorage": origin["localStorage"]}
+                   for origin in state.get("origins", [])
+                   if _is_nexus_url(origin.get("origin", "")) and origin.get("localStorage")]
+        # The ready signed-in page is the authentication proof. Cookie names
+        # are site implementation details and may change at any time.
+        if not cookies and not origins:
             raise RuntimeError("未取得有效的 N 网登录信息，原登录信息已保留。")
-        raw = {"cookies": cookies, "origins": []}
+        # Recheck after reading storage: a redirect/challenge must not replace
+        # a previously usable session with an incomplete snapshot.
+        if not await self._logged_in_anywhere(context):
+            raise RuntimeError("N 网登录尚未完成，原登录信息已保留。")
+        raw = {"cookies": cookies, "origins": origins}
         _atomic_json(self.session_file, raw)
         _atomic_json(config.SESSION_META_FILE, {
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),

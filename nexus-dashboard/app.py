@@ -161,6 +161,9 @@ async def _start_refresh(force: bool = False) -> bool:
         login = None
     state.refresh_force = force
     state.refresh_waiting_for_login = login
+    # A retry has its own outcome. Keeping the previous error here makes
+    # the UI report failure (and stop waiting) while the new scan is running.
+    state.refresh_error = None
     state.refresh_task = asyncio.create_task(_refresh_when_ready(login, caller))
     return True
 

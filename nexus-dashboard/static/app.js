@@ -226,7 +226,7 @@ async function refreshStatus(showNotice = true) {
 
   const auth = $("authChip");
   if (st.auth) {
-    auth.textContent = "已登录";
+    auth.textContent = "登录信息已保存";
     auth.className = "chip chip-ok";
   } else {
     auth.textContent = "未登录";
@@ -285,7 +285,7 @@ async function refreshStatus(showNotice = true) {
     stopPolling();
   }
 
-  if (st.refresh_error) {
+  if (st.refresh_error && !state.jobRunning) {
     setNotice(`刷新失败: ${st.refresh_error}`);
   } else if (showNotice && st.login &&
              (st.login.state === "waiting" || st.login.state === "importing")) {
@@ -299,7 +299,8 @@ async function refreshStatus(showNotice = true) {
 
 function ensurePolling() {
   if (state.pollTimer) return;
-  state.lastRefreshVersion = null;   // 首次 tick 只记录，返回 true 表示应重载
+  // Capture before the first tick: a quick retry can finish between polls.
+  state.lastRefreshVersion = state.refreshVersion;
   state.pollTimer = setInterval(async () => {
     await refreshStatus(false);
     const rv = state.refreshVersion;
@@ -458,6 +459,8 @@ function pollLoginImport() {
       clearInterval(t);
       setNotice("会话已保存，开始抓取");
       await refreshStatus(true);
+      // Login's scan may already be finished before the import poll sees it.
+      if (!state.jobRunning) await loadMods(true);
     } else if (s === "error") {
       clearInterval(t);
       setNotice(`操作失败: ${st.login.message}`);
@@ -662,7 +665,7 @@ function waitForJobStart(beforeRefresh = null, beforeVersion = null) {
       setNotice(`状态查询失败: ${e.message}`);
       return;
     }
-    if (st.refresh_error) {
+    if (st.refresh_error && !(st.job && st.job.running)) {
       clearInterval(t);
       setNotice(`刷新失败: ${st.refresh_error}`);
       return;
