@@ -790,43 +790,81 @@ async def download_open_folder(request: Request):
 
 
 # ----------------------------------------------------- "discard" tags (post-processing)
-def _load_discarded() -> list[int]:
-    """用户手动“丢弃”的模组 id 清单（独立于已抓取的缓存数据）。"""
+def _load_discarded() -> dict:
+    """归档独立保存模组快照，同时兼容旧版仅含 ids 的文件。"""
     try:
-        if config.DISCARD_FILE.is_file():
-            data = json.loads(config.DISCARD_FILE.read_text(encoding="utf-8"))
-            return sorted({int(x) for x in data.get("ids", [])})
-    except Exception:
-        pass
-    return []
+        data = read_json(config.DISCARD_FILE, {"ids": [], "items": []})
+        ids = sorted({int(x) for x in data.get("ids", [])})
+        items = {int(m["mod_id"]): dict(m, mod_id=int(m["mod_id"]))
+                 for m in data.get("items", []) if int(m["mod_id"]) in ids}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        log.warning("could not load archive: %s", exc)
+        raise HTTPException(500, "读取归档失败，原文件已保留")
+    # 旧版只保存 ID；启动时监测列表尚未加载，先从未过滤的历史缓存恢复名称和日期。
+    missing = {mid for mid in ids if mid not in items or
+               items[mid].get("name") == f"{config.TARGET_GAME}/{mid}"}
+    if missing:
+        collector = runner()
+        for row in collector._load_scan_cache() or []:
+            try:
+                mid = int(row["mod_id"])
+                if mid in missing and row.get("domain") == config.TARGET_GAME:
+                    items[mid] = dict(collector._slim_entry(row), mod_id=mid)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue  # 可选历史缓存中的坏行不影响归档本身。
+    # 优先补全/更新仍在监测列表中的记录；缺失的旧 ID 也提供可恢复的卡片。
+    for mod in state.mods:
+        mod_id = int(mod["mod_id"])
+        if mod_id in ids:
+            items[mod_id] = dict(mod, mod_id=mod_id)
+    for mod_id in ids:
+        items.setdefault(mod_id, {
+            "mod_id": mod_id, "game_domain": config.TARGET_GAME,
+            "name": f"{config.TARGET_GAME}/{mod_id}",
+            "url": f"{config.SITE}/{config.TARGET_GAME}/mods/{mod_id}",
+        })
+    result = {"ids": ids, "items": [items[mid] for mid in ids]}
+    if result != data:
+        _save_discarded(result)
+    return result
 
 
-def _save_discarded(ids: list[int]) -> None:
-    config.ensure_dirs()
-    config.DISCARD_FILE.write_text(
-        json.dumps({"ids": sorted(ids)}, ensure_ascii=False), encoding="utf-8"
-    )
+def _save_discarded(data: dict) -> None:
+    atomic_json(config.DISCARD_FILE, data)
 
 
 @app.get("/api/discarded")
 async def discarded():
-    return {"ids": _load_discarded()}
+    return _load_discarded()
 
 
 @app.post("/api/discarded/toggle")
 async def discarded_toggle(request: Request):
     try:
         body = await request.json()
-        mod_id = int(body.get("mod_id"))
+        mod_id = body.get("mod_id")
+        if type(mod_id) is not int or mod_id <= 0:
+            raise ValueError("invalid mod id")
+        item = body.get("item")
+        if item is not None and (not isinstance(item, dict) or item.get("mod_id") != mod_id):
+            raise ValueError("snapshot does not match mod id")
     except Exception:
         raise HTTPException(400, "需要 JSON: {\"mod_id\": 123}")
-    ids = _load_discarded()
+    data = _load_discarded()
+    ids = data["ids"]
     if mod_id in ids:
         ids.remove(mod_id)
+        data["items"] = [m for m in data["items"] if m["mod_id"] != mod_id]
     else:
         ids.append(mod_id)
-    _save_discarded(ids)
-    return {"ids": ids}
+        ids.sort()
+        item = next((m for m in state.mods if int(m["mod_id"]) == mod_id), item)
+        if item is None:
+            raise HTTPException(400, "模组记录尚未加载，请重试")
+        data["items"].append(dict(item, mod_id=mod_id))
+        data["items"].sort(key=lambda m: m["mod_id"])
+    _save_discarded(data)
+    return data
 
 
 # ---------------------------------------------------------------------- main

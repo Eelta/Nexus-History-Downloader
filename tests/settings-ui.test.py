@@ -384,11 +384,42 @@ try:
         assert name.input_value() == '玩家自定模组名称'
         page.locator('.mo2-confirm-form button[type="submit"]').click()
         page.wait_for_function("mo2Preview.jobs[0].installName === '玩家自定模组名称' && mo2Preview.jobs[0].state === 'queued'")
-        page.evaluate('state.discarded = new Set([1001]); renderList()')
+        page.evaluate('window.__qaOriginalItems = [...state.items]')
+        page.evaluate('toggleDiscard(1001)')
+        assert page.evaluate('[...state.discarded]') == [1001]
+        assert page.evaluate('state.discardedItems[0].name') == 'SkyUI SE（静态预览示例）'
         page.locator('#btnDiscardToggle').click()
         assert page.locator('.mod-card.discarded').count() == 1
+        page.evaluate('previewDiscarded.set(1001, {...previewDiscarded.get(1001), name:"刷新后补全的归档名称"}); loadMods()')
+        assert page.evaluate('state.discardedItems[0].name') == '刷新后补全的归档名称'
+        page.evaluate('previewDiscarded.set(1001, {...previewDiscarded.get(1001), name:"SkyUI SE（静态预览示例）"})')
+        page.evaluate('state.items = []; state.discarded = new Set(); state.discardedItems = []; loadDiscarded()')
+        assert page.locator('.mod-card').count() == 1
+        assert page.locator('.mod-card.discarded .mod-title').inner_text() == 'SkyUI SE（静态预览示例）'
+        assert page.locator('.mod-card.discarded .discard-btn').inner_text() == '恢复'
+        passed('Archive snapshots reload independently when the entire live mod list is empty')
+        page.locator('#modSearch').fill('不存在的归档名称')
+        page.wait_for_function("document.querySelectorAll('.mod-card').length === 0")
+        page.locator('#btnClearSearch').click()
+        page.wait_for_function("document.querySelectorAll('.mod-card.discarded').length === 1")
+        page.evaluate("""() => {
+          window.__qaHook = request => {
+            if (request.path === '/api/discarded') return Promise.reject(new Error('archive unavailable'));
+          };
+          return loadDiscarded();
+        }""")
+        assert page.locator('.mod-card.discarded').count() == 1
+        assert '加载归档失败' in page.locator('#noticeText').inner_text()
+        page.evaluate('__qaHook = null')
+        page.locator('.mod-card.discarded .discard-btn').click()
+        page.wait_for_function('state.discarded.size === 0')
+        assert page.locator('.mod-card.discarded').count() == 0
+        assert page.locator('.mod-card').count() == 1
+        assert page.evaluate('state.discardedItems') == []
+        assert page.evaluate('(async () => (await inlineApi("/api/discarded")).items)()') == []
         page.locator('#btnDiscardToggle').click()
-        assert page.evaluate('[...state.discarded]') == [1001]
+        page.evaluate('state.items = __qaOriginalItems; renderList()')
+        passed('Archive search, restore with missing live data and load-failure preservation work through the API contract')
         passed('Wallpaper rotation, MO2 editable confirmation and archive records remain functional')
 
         # Connection changes must update queued status without disturbing another name draft.

@@ -119,6 +119,7 @@ const state = {
   jobRunning: false,
   pollTimer: null,
   discarded: new Set(),   // 用户手动“丢弃”的 mod_id
+  discardedItems: [],     // 独立持久化的归档快照，不依赖当前监测列表
   showDiscarded: false,   // 「历史丢弃」开关
   dlMarks: {},            // mod_id -> 点击时间ISO：实时“已下载”标记（N网历史滞后时的即时状态）
 };
@@ -183,8 +184,13 @@ async function inlineApi(path, opts) {
   if (path === "/api/progress") {
     return { running: false, total: 0, done: 0, current: "", errors: [] };
   }
-  if (path === "/api/discarded") {
-    return { ids: [] };
+  if (path === "/api/discarded/toggle") {
+    const { mod_id, item } = JSON.parse(opts.body);
+    if (previewDiscarded.has(mod_id)) previewDiscarded.delete(mod_id);
+    else previewDiscarded.set(mod_id, item || demo.find((m) => m.mod_id === mod_id));
+  }
+  if (path === "/api/discarded" || path === "/api/discarded/toggle") {
+    return { ids: [...previewDiscarded.keys()], items: [...previewDiscarded.values()] };
   }
   return { ok: true };
 }
@@ -395,13 +401,20 @@ function pruneDlMarks(items) {
   return changed;
 }
 
-/* ---------------- “丢弃”标签（纯后处理，不改任何缓存数据） ---------------- */
+/* ---------------- 归档快照（独立于当前监测列表） ---------------- */
+const previewDiscarded = new Map();
+
+function applyDiscarded(data) {
+  state.discarded = new Set((data.ids || []).map(Number));
+  state.discardedItems = data.items || [];
+}
+
 async function loadDiscarded() {
   try {
     const d = await api("/api/discarded");
-    state.discarded = new Set((d.ids || []).map(Number));
+    applyDiscarded(d);
   } catch (e) {
-    state.discarded = new Set();
+    setNotice(`加载归档失败: ${e.message}`);
   }
   renderList();   // 丢弃分组/序号在启动加载后立即生效
 }
@@ -414,12 +427,18 @@ async function toggleDiscard(modId, button) {
   if (button) button.disabled = true;
   card?.classList.add("is-pending");
   try {
+    const id = Number(modId);
+    const item = state.items.find((m) => Number(m.mod_id) === id)
+      || state.discardedItems.find((m) => Number(m.mod_id) === id);
+    const restoring = state.discarded.has(id);
     const d = await api("/api/discarded/toggle", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mod_id: Number(modId) }),
+      body: JSON.stringify({ mod_id: id, item }),
     });
-    state.discarded = new Set((d.ids || []).map(Number));
+    applyDiscarded(d);
+    if (restoring && !state.discarded.has(id) && item &&
+        !state.items.some((m) => Number(m.mod_id) === id)) state.items.push(item);
   } catch (e) {
     setNotice(`归档失败: ${e.message}`);
     return;
@@ -502,17 +521,21 @@ function hideNotice() {
 
 /* ------------------------------------------------------------------- mods */
 async function loadMods() {
+  // 每次刷新同时同步归档：后端可用新历史补全旧 ID 的快照。
+  const archives = loadDiscarded();
   let data;
   try {
     data = await api("/api/mods");
   } catch (e) {
     setNotice(`加载模组失败: ${e.message}`);
+    await archives;
     return;
   }
   state.items = data.items || [];
   state.total = data.total || state.items.length;
   renderList();
   $("countChip").textContent = state.total;
+  await archives;
 }
 
 /* 序号排序键：严格按更新时间（desc）；无更新时间时用创建时间兜底 */
@@ -531,10 +554,12 @@ function renderList() {
 
   // 整个列表严格按更新时间排序（从历史丢弃恢复后也自动落回正确位置）
   const query = state.query.trim().toLocaleLowerCase();
-  const order = [...state.items].sort(byUpdatedDesc).filter((mod) =>
+  const records = new Map(state.discardedItems.map((m) => [Number(m.mod_id), m]));
+  for (const mod of state.items) records.set(Number(mod.mod_id), mod);
+  const order = [...records.values()].sort(byUpdatedDesc).filter((mod) =>
     !query || `${mod.name || ""} ${mod.mod_id || ""}`.toLocaleLowerCase().includes(query));
   const droppedIds = new Set(
-    order.filter((m) => state.discarded.has(m.mod_id))
+    order.filter((m) => state.discarded.has(Number(m.mod_id)))
         .map((m) => Number(m.mod_id))
   );
 
@@ -638,8 +663,8 @@ function buildCard(m, n) {
   const db = document.createElement("button");
   db.type = "button";
   db.className = "discard-btn";
-  db.textContent = state.discarded.has(m.mod_id) ? "恢复" : "归档";
-  db.title = state.discarded.has(m.mod_id) ? "恢复模组" : "归档模组";
+  db.textContent = state.discarded.has(Number(m.mod_id)) ? "恢复" : "归档";
+  db.title = state.discarded.has(Number(m.mod_id)) ? "恢复模组" : "归档模组";
   db.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
@@ -1607,9 +1632,10 @@ function wireEvents() {
     if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) settingsDialog.close();
   });
   $("btnRefresh").addEventListener("click", () => startRefresh(true));
-  $("btnDiscardToggle").addEventListener("click", () => {
+  $("btnDiscardToggle").addEventListener("click", async () => {
     state.showDiscarded = !state.showDiscarded;
     renderList();
+    if (state.showDiscarded) await loadDiscarded();
   });
 
   $("btnProfile").addEventListener("click", async () => {
@@ -1721,7 +1747,6 @@ async function boot() {
   reportStartup("settings-ready");
   await refreshStatus(true);
   await loadMods();
-  await loadDiscarded();
   reportStartup("library-ready");
   if (!PREVIEW_MODE) startDlWatcher();   // 实时下载进度 + 失败提示
 
