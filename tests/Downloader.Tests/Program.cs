@@ -54,6 +54,9 @@ internal static class Program
         using (var server = new TestServer(2 * 1024 * 1024, supportRange: true))
             await RunHeaderTestAsync("⑨ 浏览器会话 Cookie 头随请求送达", server);
 
+        // Exhausted retries must preserve the real server error for diagnosis.
+        await RunHttpErrorTestAsync();
+
         Console.WriteLine();
         if (_failed == 0)
         {
@@ -264,6 +267,29 @@ internal static class Program
         }
     }
 
+    private static async Task RunHttpErrorTestAsync()
+    {
+        var dir = CreateTestDir();
+        try
+        {
+            using var server = new TestServer(0, supportRange: false, errorStatus: HttpStatusCode.Forbidden);
+            using var dl = new SegmentedDownloader(new DownloadOptions { RootDirectory = dir });
+            try
+            {
+                await dl.DownloadAsync(server.BaseUrl + "denied.bin", Path.Combine(dir, "out.bin"));
+                Fail("HTTP failure details", "Expected a download failure");
+            }
+            catch (Exception error)
+            {
+                Pass("HTTP failure details", error.Message.Contains("HTTP 403") &&
+                    !File.Exists(Path.Combine(dir, "out.bin")) &&
+                    Directory.GetFiles(dir, "*.tmp", SearchOption.AllDirectories).Length == 0,
+                    error.Message);
+            }
+        }
+        finally { TryDeleteDir(dir); }
+    }
+
     // ---------------- 工具 ---------------- //
 
     private static string CreateTestDir()
@@ -313,6 +339,7 @@ internal static class Program
         private readonly HttpListener _listener = new();
         private readonly Thread _thread;
         private readonly bool _supportRange;
+        private readonly HttpStatusCode? _errorStatus;
         private volatile bool _running = true;
 
         public byte[] Data { get; }
@@ -320,9 +347,10 @@ internal static class Program
         /// <summary>最近一次请求携带的 Cookie 头（用于验证自定义请求头送达）。</summary>
         public volatile string? LastCookie;
 
-        public TestServer(long byteCount, bool supportRange)
+        public TestServer(long byteCount, bool supportRange, HttpStatusCode? errorStatus = null)
         {
             _supportRange = supportRange;
+            _errorStatus = errorStatus;
             Data = new byte[byteCount];
             Rnd.NextBytes(Data);
             int port = FindFreePort();
@@ -348,6 +376,13 @@ internal static class Program
         private void Handle(HttpListenerContext ctx)
         {
             var resp = ctx.Response;
+            if (_errorStatus is { } status)
+            {
+                resp.StatusCode = (int)status;
+                resp.ContentLength64 = 0;
+                resp.Close();
+                return;
+            }
             LastCookie = ctx.Request.Headers["Cookie"];
             string? range = ctx.Request.Headers["Range"];
             long start = 0, end = Data.Length - 1;

@@ -752,7 +752,6 @@ async function startRefresh(force = false) {
 
 /* ------------------------------------------------------------ 下载接管 */
 /* 点击模组名：自动打开/激活接管窗口并跳到该模组的文件页（无独立按钮 UI） */
-let lastAnnouncedJob = null;   // 已完成/失败提示去重（按任务 id）
 
 async function openTakeoverFor(url) {
   setNotice("正在打开接管窗口…");
@@ -889,14 +888,12 @@ async function dlTick() {
   const done = jobs.find((j) => j.state === "done" && recent(j) && dlSeen[j.id] !== "done");
   if (done) {
     dlSeen[done.id] = "done";
-    lastAnnouncedJob = done.id;
     showDoneNotice(done.savePath || "(未知位置)", done);
     return;
   }
-  const bad = jobs.find((j) => j.state === "error" && recent(j) && j.id !== lastAnnouncedJob);
+  const bad = jobs.find((j) => j.state === "error" && recent(j) && dlSeen[j.id] !== "error");
   if (bad) {
     dlSeen[bad.id] = "error";
-    lastAnnouncedJob = bad.id;
     addToast("下载失败", bad.error || "未知错误（详见服务日志）", true, null);
   }
 }

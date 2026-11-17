@@ -295,7 +295,8 @@ public sealed class SegmentedDownloader : IDisposable
                 if (!c0.Faulted || c0.Finished) return;
                 if (c0.RespawnCount >= MaxRespawnPerChunk)
                 {
-                    _fatalError = "无法连接服务器或服务器无响应。";
+                    _fatalError = "无法连接服务器或服务器无响应。" +
+                        (c0.LastError is null ? "" : $" 原因：{c0.LastError}");
                     return;
                 }
                 c0.Faulted = false;
@@ -318,7 +319,8 @@ public sealed class SegmentedDownloader : IDisposable
                     c.Faulted = false;
                     if (c.RespawnCount >= MaxRespawnPerChunk)
                     {
-                        _fatalError = $"分片 {c.Index} 多次重试仍失败，下载终止。";
+                        _fatalError = $"分片 {c.Index} 多次重试仍失败，下载终止。" +
+                            (c.LastError is null ? "" : $" 原因：{c.LastError}");
                         return;
                     }
                     c.RespawnCount++;
@@ -450,6 +452,7 @@ public sealed class SegmentedDownloader : IDisposable
                     Log($"致命错误：{ex.Message}");
                     return;
                 }
+                c.LastError = ex.GetBaseException().Message;
                 c.Faulted = true;
                 Log($"分片 {c.Index} 出错：{ex.Message}");
             }
@@ -866,6 +869,7 @@ public sealed class SegmentedDownloader : IDisposable
         public string TempPath = string.Empty;
         public volatile bool Finished;
         public volatile bool Faulted;
+        public string? LastError;
         public int RespawnCount;
         public long LastReceiveTime;
     }
