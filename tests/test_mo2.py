@@ -118,6 +118,39 @@ class InstallTests(unittest.TestCase):
         self.respond(job, "error")
         self.assertTrue(self.archive.exists())
 
+    def test_dismiss_failed_record_preserves_files_and_survives_replay(self):
+        target = self.add_mod("Existing mod")
+        archive = self.archive.read_bytes()
+        metadata = (target / "meta.ini").read_bytes()
+        job = self.enqueue(delete=True)
+        with self.assertRaisesRegex(ValueError, "只能移除失败"):
+            self.manager.dismiss(job["id"])
+        self.respond(job, "error")
+        self.assertEqual(self.manager.dismiss(job["id"])["jobs"], [])
+        self.assertEqual(self.manager.dismiss(job["id"])["jobs"], [])
+        self.assertEqual(self.archive.read_bytes(), archive)
+        self.assertEqual((target / "meta.ini").read_bytes(), metadata)
+        history = self.root / "cache" / "takeover-history.jsonl"
+        history.write_text(json.dumps(self.download) + "\n", encoding="utf-8")
+        restored = MO2Manager(self.root, self.manager.assets)
+        restored.tick([self.download])
+        self.assertEqual(restored.jobs, {})
+        restored.tick([{**self.download, "id": "new-download"}])
+        self.assertEqual(len(restored.jobs), 1)
+
+    def test_failed_record_can_be_dismissed_after_archive_disappears(self):
+        job = self.enqueue()
+        self.archive.unlink()
+        self.respond(job, "error")
+        with self.assertRaisesRegex(ValueError, "找不到安装包"):
+            self.manager.retry(job["id"])
+        with patch.object(self.manager, "save", side_effect=OSError("disk full")), self.assertRaises(OSError):
+            self.manager.dismiss(job["id"])
+        self.assertEqual(self.manager.status()["jobs"], [job])
+        restored = MO2Manager(self.root, self.manager.assets)
+        self.assertEqual(restored.status()["jobs"], [job])
+        self.assertEqual(restored.dismiss(job["id"])["jobs"], [])
+
     def test_changed_file_cannot_be_deleted(self):
         job = self.enqueue(delete=True)
         self.archive.write_bytes(b"different archive data")

@@ -1011,6 +1011,7 @@ const mo2State = {
   drafts: new Map(),
   rows: new Map(),
   busy: new Set(),
+  dismissed: new Set(),
   jobs: [],
   bridge: { state: "unavailable", message: "" },
 };
@@ -1031,10 +1032,12 @@ const mo2Preview = {
 function previewMo2Api(path, opts) {
   const data = opts && opts.body ? JSON.parse(opts.body) : {};
   if (path === "/api/mo2/settings") Object.assign(mo2Preview.settings, data);
-  const action = path.match(/^\/api\/mo2\/jobs\/([^/]+)\/(confirm|retry|skip)$/);
+  const action = path.match(/^\/api\/mo2\/jobs\/([^/]+)\/(confirm|retry|skip|dismiss)$/);
   if (action) {
     const job = mo2Preview.jobs.find((item) => item.id === decodeURIComponent(action[1]));
-    if (job) {
+    if (job?.state === "error" && action[2] === "dismiss") {
+      mo2Preview.jobs = mo2Preview.jobs.filter((item) => item !== job);
+    } else if (job && action[2] !== "dismiss") {
       job.state = { confirm: "queued", retry: "awaiting_confirmation", skip: "cancelled" }[action[2]];
       if (action[2] === "confirm") job.installName = data.installName;
       job.message = "静态预览，不会安装或删除实际文件。";
@@ -1081,7 +1084,10 @@ function showMo2Status(result, applySettings = false) {
     mo2State.settingsLoaded = true;
   }
   if (result.bridge) showMo2Bridge(result.bridge);
-  if (Array.isArray(result.jobs)) mo2State.jobs = result.jobs;
+  // A status request started before dismissal may still contain the removed job.
+  if (Array.isArray(result.jobs)) {
+    mo2State.jobs = result.jobs.filter((job) => !mo2State.dismissed.has(String(job.id)));
+  }
   renderMo2Jobs();
 }
 
@@ -1259,12 +1265,22 @@ function buildMo2Job(job) {
   }
   if (job.archiveDeleted) row.appendChild(mo2Element("p", "mo2-job-message", "安装包已删除"));
   if (job.cleanupError) row.appendChild(mo2Element("p", "mo2-job-error", `清理失败：${job.cleanupError}`));
-  if ((job.state === "error" || job.state === "cancelled") && !job.archiveDeleted) {
+  const canRetry = (job.state === "error" || job.state === "cancelled") && !job.archiveDeleted;
+  if (canRetry || job.state === "error") {
     const actions = mo2Element("div", "mo2-job-actions");
-    const retry = mo2Element("button", "btn", "重试");
-    retry.type = "button";
-    retry.addEventListener("click", () => mo2JobAction(job, "retry", {}, row, error));
-    actions.appendChild(retry);
+    if (canRetry) {
+      const retry = mo2Element("button", "btn", "重试");
+      retry.type = "button";
+      retry.addEventListener("click", () => mo2JobAction(job, "retry", {}, row, error));
+      actions.appendChild(retry);
+    }
+    if (job.state === "error") {
+      const dismiss = mo2Element("button", "btn", "移除记录");
+      dismiss.type = "button";
+      dismiss.title = "移除失败记录，保留安装包和模组";
+      dismiss.addEventListener("click", () => mo2JobAction(job, "dismiss", {}, row, error));
+      actions.appendChild(dismiss);
+    }
     row.appendChild(actions);
   }
   row.appendChild(error);
@@ -1282,6 +1298,7 @@ async function mo2JobAction(job, action, payload, row, errorElement) {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
     });
     if (result.ok === false) throw new Error(result.message || "操作失败");
+    if (action === "dismiss") mo2State.dismissed.add(id);
     mo2State.busy.delete(id);
     if (Array.isArray(result.jobs)) showMo2Status(result);
     else await refreshMo2Status();

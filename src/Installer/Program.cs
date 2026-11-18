@@ -61,7 +61,7 @@ internal static class Program
             if (shortcut) CreateShortcut(target, dir);
             using var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(UninstallKey);
             k.SetValue("DisplayName", "Nexus History Downloader");
-            k.SetValue("DisplayVersion", "2.48");
+            k.SetValue("DisplayVersion", "2.49");
             k.SetValue("InstallLocation", dir);
             k.SetValue("DisplayIcon", target);
             k.SetValue("UninstallString", $"\"{Path.Combine(dir, "Uninstall.exe")}\" --uninstall \"{dir}\"");

@@ -503,6 +503,30 @@ try:
         assert not page.locator('#mo2History').evaluate('el => el.open')
         passed('Cancelled jobs count as skipped separately from installed mods')
 
+        page.evaluate("""() => {
+          mo2Preview.jobs.push({id:'qa-error', state:'error', filename:'Missing-fixture.zip',
+                                message:'找不到安装包'});
+          return refreshMo2Status();
+        }""")
+        failed = page.locator('#mo2Jobs .mo2-job').filter(has_text='Missing-fixture.zip')
+        assert failed.get_by_role('button', name='重试').is_visible()
+        assert page.get_by_role('button', name='移除记录').count() == 1
+        page.evaluate("""() => {
+          const stale = JSON.parse(JSON.stringify(mo2Preview));
+          __qaHook = request => request.path === '/api/mo2/status'
+            ? new Promise(resolve => { window.__qaReleaseOldStatus = () => resolve(stale); })
+            : undefined;
+          refreshMo2Status();
+        }""")
+        failed.get_by_role('button', name='移除记录').click()
+        failed.wait_for(state='detached')
+        assert page.evaluate("__qaRequests.filter(r => r.path === '/api/mo2/jobs/qa-error/dismiss').length") == 1
+        page.evaluate('__qaHook = null; __qaReleaseOldStatus()')
+        page.wait_for_function('!mo2State.polling')
+        assert failed.count() == 0
+        assert page.locator('#mo2HistorySummary').inner_text() == '已安装 1 · 已跳过 1'
+        passed('Dismissing a failed MO2 job removes the card and ignores stale polling results')
+
         page.evaluate("mo2Preview.jobs[0].cleanupError = 'fixture archive locked'; refreshMo2Status()")
         assert not page.locator('#mo2History').evaluate('el => el.open')
         page.locator('#mo2HistorySummary').click()

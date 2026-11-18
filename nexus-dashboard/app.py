@@ -626,6 +626,11 @@ async def mo2_retry(job_id: str):
     return await _mo2_call(mo2_manager.retry, job_id)
 
 
+@app.post("/api/mo2/jobs/{job_id}/dismiss")
+async def mo2_dismiss(job_id: str):
+    return await _mo2_call(mo2_manager.dismiss, job_id)
+
+
 @app.post("/api/mo2/jobs/{job_id}/skip")
 async def mo2_skip(job_id: str):
     return await _mo2_call(mo2_manager.skip, job_id)

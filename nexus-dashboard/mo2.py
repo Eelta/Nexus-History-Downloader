@@ -264,10 +264,15 @@ class MO2Manager:
                 "deleteAfterInstall": saved.get("deleteAfterInstall", False),
                 "historyRetentionDays": retention}
 
-    def save(self):
+    def save(self, jobs: dict | None = None):
         if self.error:
             raise ValueError(self.error)
-        atomic_json(self.state_file, self.jobs)
+        atomic_json(self.state_file, self.jobs if jobs is None else jobs)
+
+    def _record_tombstones(self, keys: set[str]):
+        tombstones = self.tombstones | keys
+        atomic_json(self.tombstone_file, {"version": 1, "ids": sorted(tombstones)})
+        self.tombstones = tombstones
 
     def prune_history(self, retention: int) -> bool:
         """Drop expired display records without touching packages or mods.
@@ -294,9 +299,7 @@ class MO2Manager:
                     and job["completedAt"] < now - retention * 86400):
                 expired.add(key)
         if expired:
-            tombstones = self.tombstones | expired
-            atomic_json(self.tombstone_file, {"version": 1, "ids": sorted(tombstones)})
-            self.tombstones = tombstones
+            self._record_tombstones(expired)
             for key in expired:
                 del self.jobs[key]
             changed = True
@@ -509,10 +512,28 @@ class MO2Manager:
             job = self.jobs[key]
             if job["state"] not in ("error", "cancelled"):
                 raise ValueError("只能重试已取消或失败的安装")
-            fingerprint(Path(job["archivePath"]))
+            try:
+                fingerprint(Path(job["archivePath"]))
+            except FileNotFoundError:
+                raise ValueError("找不到安装包。请恢复原文件或重新下载。") from None
             job.update({"state": "awaiting_confirmation", "message": "请重新确认名称后安装"})
             job.pop("completedAt", None)
             self.save()
+            return self.status()
+
+    def dismiss(self, key: str):
+        with self.lock:
+            if self.error:
+                raise ValueError(self.error)
+            if key not in self.jobs and key in self.tombstones:
+                return self.status()
+            if self.jobs[key]["state"] != "error":
+                raise ValueError("只能移除失败的安装记录")
+            self._record_tombstones({key})
+            remaining = self.jobs.copy()
+            del remaining[key]
+            self.save(remaining)
+            self.jobs = remaining
             return self.status()
 
     def skip(self, key: str):
